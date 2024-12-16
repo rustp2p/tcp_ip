@@ -19,8 +19,7 @@ pub async fn main() -> anyhow::Result<()> {
     ip_stack_config.mtu = MTU;
     let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let udp_socket = UdpSocket::bind_all(ip_stack.clone()).await?;
-    let udp_socket_8080 =
-        UdpSocket::bind(ip_stack.clone(), "0.0.0.0:8080".parse().unwrap()).await?;
+    let udp_socket_8080 = UdpSocket::bind(ip_stack.clone(), "0.0.0.0:8080".parse().unwrap()).await?;
 
     let h1 = tokio::spawn(async {
         if let Err(e) = udp_recv(udp_socket, "hello".into()).await {
@@ -64,10 +63,7 @@ async fn udp_recv(udp_socket: UdpSocket, prefix: String) -> anyhow::Result<()> {
     }
 }
 
-async fn tun_to_ip_stack(
-    dev: Arc<AsyncDevice>,
-    mut ip_stack_send: IpStackSend,
-) -> anyhow::Result<()> {
+async fn tun_to_ip_stack(dev: Arc<AsyncDevice>, mut ip_stack_send: IpStackSend) -> anyhow::Result<()> {
     let mut buf = [0; MTU as usize];
     loop {
         let len = dev.recv(&mut buf).await?;
@@ -75,10 +71,7 @@ async fn tun_to_ip_stack(
         if packet.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Udp {
             log::debug!("tun_to_ip_stack {packet:?}");
             let udp_packet = pnet_packet::udp::UdpPacket::new(packet.payload()).unwrap();
-            log::debug!(
-                "tun_to_ip_stack udp_packet={udp_packet:?} payload={:?}",
-                udp_packet.payload()
-            );
+            log::debug!("tun_to_ip_stack udp_packet={udp_packet:?} payload={:?}", udp_packet.payload());
         }
 
         if let Err(e) = ip_stack_send.send_ip_packet(&buf[..len]).await {
@@ -87,10 +80,7 @@ async fn tun_to_ip_stack(
     }
 }
 
-async fn ip_stack_to_tun(
-    mut ip_stack_recv: IpStackRecv,
-    dev: Arc<AsyncDevice>,
-) -> anyhow::Result<()> {
+async fn ip_stack_to_tun(mut ip_stack_recv: IpStackRecv, dev: Arc<AsyncDevice>) -> anyhow::Result<()> {
     let mut bufs = Vec::with_capacity(128);
     let mut sizes = vec![0; 128];
     for _ in 0..128 {
@@ -106,10 +96,7 @@ async fn ip_stack_to_tun(
             log::debug!("ip_stack_to_tun {packet:?}");
             if packet.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Udp {
                 let udp_packet = pnet_packet::udp::UdpPacket::new(packet.payload()).unwrap();
-                log::debug!(
-                    "ip_stack_to_tun udp_packet={udp_packet:?} payload={:?}",
-                    udp_packet.payload()
-                );
+                log::debug!("ip_stack_to_tun udp_packet={udp_packet:?} payload={:?}", udp_packet.payload());
             }
 
             dev.send(&buf[..len]).await?;

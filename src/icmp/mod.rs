@@ -39,10 +39,7 @@ impl IcmpSocket {
     pub async fn send_to(&self, buf: &[u8], addr: IpAddr) -> io::Result<usize> {
         let from = self.local_addr;
         if from == UNSPECIFIED_ADDR {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "need to specify source address",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
         }
         self.send_from_to(buf, from.ip(), addr).await
     }
@@ -59,11 +56,7 @@ impl IcmpSocket {
             ));
         }
         buf[..len].copy_from_slice(&packet.buf);
-        Ok((
-            len,
-            packet.network_tuple.src.ip(),
-            packet.network_tuple.dst.ip(),
-        ))
+        Ok((len, packet.network_tuple.src.ip(), packet.network_tuple.dst.ip()))
     }
     pub async fn send_from_to(&self, buf: &[u8], src: IpAddr, dst: IpAddr) -> io::Result<usize> {
         if buf.len() > u16::MAX as usize - 8 {
@@ -79,14 +72,7 @@ impl IcmpSocket {
         let network_tuple = NetworkTuple::new(src, dst, IpNextHeaderProtocols::Icmp);
 
         let packet = TransportPacket::new(data, network_tuple);
-        if self
-            .ip_stack
-            .inner
-            .packet_sender
-            .send(packet)
-            .await
-            .is_err()
-        {
+        if self.ip_stack.inner.packet_sender.send(packet).await.is_err() {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
         Ok(buf.len())
@@ -94,8 +80,6 @@ impl IcmpSocket {
 }
 impl Drop for IcmpSocket {
     fn drop(&mut self) {
-        _ = self
-            .ip_stack
-            .remove_socket(IpNextHeaderProtocols::Icmp, &self.local_addr);
+        _ = self.ip_stack.remove_socket(IpNextHeaderProtocols::Icmp, &self.local_addr);
     }
 }

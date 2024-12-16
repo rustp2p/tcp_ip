@@ -39,17 +39,11 @@ impl UdpSocket {
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         let from = self.local_addr;
         if from == UNSPECIFIED_ADDR {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "need to specify source address",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
         }
         self.send_from_to(buf, from, addr).await
     }
-    pub async fn recv_from_to(
-        &self,
-        buf: &mut [u8],
-    ) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+    pub async fn recv_from_to(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
         let Ok(packet) = self.packet_receiver.recv_async().await else {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         };
@@ -63,12 +57,7 @@ impl UdpSocket {
         buf[..len].copy_from_slice(udp_packet.payload());
         Ok((len, packet.network_tuple.src, packet.network_tuple.dst))
     }
-    pub async fn send_from_to(
-        &self,
-        buf: &[u8],
-        src: SocketAddr,
-        dst: SocketAddr,
-    ) -> io::Result<usize> {
+    pub async fn send_from_to(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<usize> {
         if buf.len() > u16::MAX as usize - 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "buf too long"));
         }
@@ -83,22 +72,12 @@ impl UdpSocket {
         data.extend_from_slice(buf);
 
         let checksum = match (src.ip(), dst.ip()) {
-            (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => pnet_packet::util::ipv4_checksum(
-                &data,
-                3,
-                &[],
-                &src_ip,
-                &dst_ip,
-                IpNextHeaderProtocols::Tcp,
-            ),
-            (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => pnet_packet::util::ipv6_checksum(
-                &data,
-                3,
-                &[],
-                &src_ip,
-                &dst_ip,
-                IpNextHeaderProtocols::Tcp,
-            ),
+            (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
+                pnet_packet::util::ipv4_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+            }
+            (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
+                pnet_packet::util::ipv6_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+            }
             (_, _) => {
                 unreachable!()
             }
@@ -114,8 +93,6 @@ impl UdpSocket {
 }
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        _ = self
-            .ip_stack
-            .remove_socket(IpNextHeaderProtocols::Udp, &self.local_addr);
+        _ = self.ip_stack.remove_socket(IpNextHeaderProtocols::Udp, &self.local_addr);
     }
 }

@@ -60,10 +60,7 @@ async fn icmp_recv(icmp_socket: IcmpSocket) -> anyhow::Result<()> {
     }
 }
 
-async fn tun_to_ip_stack(
-    dev: Arc<AsyncDevice>,
-    mut ip_stack_send: IpStackSend,
-) -> anyhow::Result<()> {
+async fn tun_to_ip_stack(dev: Arc<AsyncDevice>, mut ip_stack_send: IpStackSend) -> anyhow::Result<()> {
     let mut buf = [0; MTU as usize];
     loop {
         let len = dev.recv(&mut buf).await?;
@@ -73,10 +70,7 @@ async fn tun_to_ip_stack(
     }
 }
 
-async fn ip_stack_to_tun(
-    mut ip_stack_recv: IpStackRecv,
-    dev: Arc<AsyncDevice>,
-) -> anyhow::Result<()> {
+async fn ip_stack_to_tun(mut ip_stack_recv: IpStackRecv, dev: Arc<AsyncDevice>) -> anyhow::Result<()> {
     let mut bufs = Vec::with_capacity(128);
     let mut sizes = vec![0; 128];
     for _ in 0..128 {

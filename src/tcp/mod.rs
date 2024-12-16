@@ -1,9 +1,10 @@
+#![allow(unused, unused_variables)]
+
 use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket, UNSPECIFIED_ADDR};
 use crate::tcp::tcb::{Tcb, TcbRead, TcbWrite};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::TcpFlags::{ACK, PSH, RST, SYN};
-use rand::RngCore;
 use std::collections::HashMap;
 use std::io;
 use std::io::Error;
@@ -12,14 +13,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use pnet_packet::tcp::TcpPacket;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::futures::Notified;
-use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
-use tokio_util::sync::{PollSendError, PollSender};
+use tokio_util::sync::PollSender;
 
 mod tcb;
 
@@ -56,14 +53,7 @@ impl TcpListener {
         loop {
             if let Some(packet) = self.packet_receiver.recv().await {
                 let network_tuple = &packet.network_tuple;
-                if let Some(v) = self
-                    .ip_stack
-                    .inner
-                    .tcp_stream_map
-                    .get(network_tuple)
-                    .as_deref()
-                    .cloned()
-                {
+                if let Some(v) = self.ip_stack.inner.tcp_stream_map.get(network_tuple).as_deref().cloned() {
                     // If a TCP stream has already been generated, hand it over to the corresponding stream
                     _ = v.send(packet).await;
                     continue;
@@ -143,8 +133,7 @@ impl TcpStream {
             packet_receiver,
             payload_sender,
         };
-        let mut stream_write =
-            TcpStreamWrite::new(tcp_context, tcb_write, ip_stack, payload_receiver_w);
+        let mut stream_write = TcpStreamWrite::new(tcp_context, tcb_write, ip_stack, payload_receiver_w);
         tokio::spawn(async move {
             if let Err(e) = stream_write.loop_send().await {
                 log::warn!("{:?}: {e:?}", network_tuple)
@@ -186,7 +175,7 @@ impl TcpStreamRead {
             if !buffer.is_empty() {
                 match self.payload_sender.send(buffer).await {
                     Ok(_) => {}
-                    Err(e) => {
+                    Err(_e) => {
                         // todo shutdown
                         log::error!("close");
                         break;
@@ -201,10 +190,12 @@ impl TcpStreamRead {
             // todo 减少接收窗口
         }
     }
+
     fn update_state(&mut self) {
         let snd_seq = self.tcp_context.snd_seq();
         self.tcb_read.update_snd_seq(snd_seq);
     }
+
     fn update_context(&self) -> u32 {
         let snd_ack = self.tcb_read.snd_ack();
         let snd_wnd = self.tcb_read.snd_wnd();
@@ -216,8 +207,7 @@ impl TcpStreamRead {
         self.tcp_context.set_snd_wnd(snd_wnd);
         self.tcp_context.set_rcv_wnd(rcv_wnd);
         self.tcp_context.set_last_ack(last_ack);
-        self.tcp_context
-            .set_duplicate_ack_count(duplicate_ack_count);
+        self.tcp_context.set_duplicate_ack_count(duplicate_ack_count);
         snd_ack_distance
     }
 }
@@ -232,12 +222,7 @@ struct TcpStreamWrite {
 }
 
 impl TcpStreamWrite {
-    fn new(
-        tcp_context: Arc<TcpContext>,
-        tcb_write: TcbWrite,
-        ip_stack: IpStack,
-        payload_receiver: Receiver<BytesMut>,
-    ) -> Self {
+    fn new(tcp_context: Arc<TcpContext>, tcb_write: TcbWrite, ip_stack: IpStack, payload_receiver: Receiver<BytesMut>) -> Self {
         Self {
             tcp_context,
             tcb_write,
@@ -407,13 +392,7 @@ struct TcpContext {
 
 impl TcpContext {
     fn from(tcb: &Tcb) -> Self {
-        Self::new(
-            tcb.snd_seq(),
-            tcb.snd_ack(),
-            tcb.last_ack(),
-            tcb.snd_wnd(),
-            tcb.rcv_wnd(),
-        )
+        Self::new(tcb.snd_seq(), tcb.snd_ack(), tcb.last_ack(), tcb.snd_wnd(), tcb.rcv_wnd())
     }
     fn new(snd_seq: u32, snd_ack: u32, last_ack: u32, snd_wnd: u16, rcv_wnd: u16) -> Self {
         Self {
@@ -469,11 +448,7 @@ impl TcpContext {
 }
 
 impl AsyncRead for TcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         if let Some(p) = self.last_buf.as_mut() {
             let len = buf.remaining().min(p.len());
             buf.put_slice(&p[..len]);
@@ -501,11 +476,7 @@ impl AsyncRead for TcpStream {
 }
 
 impl AsyncWrite for TcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         if buf.is_empty() {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
         }
@@ -523,7 +494,7 @@ impl AsyncWrite for TcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         todo!()
     }
 }

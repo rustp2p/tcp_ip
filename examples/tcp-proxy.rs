@@ -98,19 +98,14 @@ pub async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn tun_to_ip_stack(
-    dev: Arc<AsyncDevice>,
-    mut ip_stack_send: IpStackSend,
-) -> anyhow::Result<()> {
+async fn tun_to_ip_stack(dev: Arc<AsyncDevice>, mut ip_stack_send: IpStackSend) -> anyhow::Result<()> {
     let mut buf = [0; MTU as usize];
     loop {
         let len = dev.recv(&mut buf).await?;
         let packet = pnet_packet::ipv4::Ipv4Packet::new(&buf[..len]).unwrap();
         if packet.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp {
             let tcp_packet = pnet_packet::tcp::TcpPacket::new(packet.payload()).unwrap();
-            log::debug!(
-                "tun_to_ip_stack tcp_packet={tcp_packet:?}"
-            );
+            log::debug!("tun_to_ip_stack tcp_packet={tcp_packet:?}");
         }
 
         if let Err(e) = ip_stack_send.send_ip_packet(&buf[..len]).await {
@@ -119,10 +114,7 @@ async fn tun_to_ip_stack(
     }
 }
 
-async fn ip_stack_to_tun(
-    mut ip_stack_recv: IpStackRecv,
-    dev: Arc<AsyncDevice>,
-) -> anyhow::Result<()> {
+async fn ip_stack_to_tun(mut ip_stack_recv: IpStackRecv, dev: Arc<AsyncDevice>) -> anyhow::Result<()> {
     let mut bufs = Vec::with_capacity(128);
     let mut sizes = vec![0; 128];
     for _ in 0..128 {
@@ -138,9 +130,7 @@ async fn ip_stack_to_tun(
             // log::debug!("ip_stack_to_tun {packet:?}");
             if packet.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp {
                 let tcp_packet = pnet_packet::tcp::TcpPacket::new(packet.payload()).unwrap();
-                log::debug!(
-                    "ip_stack_to_tun tcp_packet={tcp_packet:?}"
-                );
+                log::debug!("ip_stack_to_tun tcp_packet={tcp_packet:?}");
             }
 
             dev.send(&buf[..len]).await?;

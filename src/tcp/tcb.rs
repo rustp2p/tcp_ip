@@ -1,6 +1,7 @@
+#![allow(dead_code)]
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Add, Sub};
 
@@ -47,13 +48,7 @@ pub(crate) struct Tcb {
 }
 
 impl Tcb {
-    pub fn new_syn_received(
-        local_addr: SocketAddr,
-        peer_addr: SocketAddr,
-        seq: u32,
-        wnd: u16,
-        mtu: u16,
-    ) -> Self {
+    pub fn new_syn_received(local_addr: SocketAddr, peer_addr: SocketAddr, seq: u32, wnd: u16, mtu: u16) -> Self {
         let common = Common::new_syn_received(local_addr, peer_addr, seq, wnd, mtu);
         Self {
             common,
@@ -82,8 +77,7 @@ impl Tcb {
                 if !packet.payload().is_empty() {
                     let sequence = packet.get_sequence();
                     buf.advance(header_len);
-                    self.unordered_packets
-                        .insert(SeqNum(sequence), UnreadPacket::new(flags, buf));
+                    self.unordered_packets.insert(SeqNum(sequence), UnreadPacket::new(flags, buf));
                 }
                 return true;
             }
@@ -100,10 +94,7 @@ impl Tcb {
         self.common.peer_addr
     }
     pub fn split(self) -> (TcbWrite, TcbRead) {
-        (
-            TcbWrite::new(self.common),
-            TcbRead::new(self.common, self.unordered_packets),
-        )
+        (TcbWrite::new(self.common), TcbRead::new(self.common, self.unordered_packets))
     }
     pub fn create_transport_packet(&self, flags: u8, payload: &[u8]) -> TransportPacket {
         self.common.create_transport_packet(flags, payload)
@@ -233,8 +224,7 @@ impl TcbRead {
                 let sequence = SeqNum(packet.get_sequence());
                 if sequence >= self.common.snd_ack {
                     buf.advance(header_len);
-                    self.unordered_packets
-                        .insert(sequence, UnreadPacket::new(flags, buf));
+                    self.unordered_packets.insert(sequence, UnreadPacket::new(flags, buf));
                 }
             }
             TcpState::FinWait1 => {}
@@ -260,7 +250,7 @@ impl TcbRead {
             let payload = &packet.payload;
             if self.common.snd_ack < seq {
                 //unordered
-                log::error!("unordered {seq:?},ack={:?}",self.common.snd_ack);
+                log::error!("unordered {seq:?},ack={:?}", self.common.snd_ack);
                 break;
             }
             if flags & FIN == FIN {
@@ -306,13 +296,8 @@ pub fn create_transport_packet_raw(
     flags: u8,
     payload: &[u8],
 ) -> TransportPacket {
-    let data = create_packet_raw(
-        local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload,
-    );
-    TransportPacket::new(
-        data,
-        NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp),
-    )
+    let data = create_packet_raw(local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload);
+    TransportPacket::new(data, NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp))
 }
 
 pub fn create_packet_raw(
@@ -339,22 +324,12 @@ pub fn create_packet_raw(
     bytes.put_u16(0);
     bytes.extend_from_slice(payload);
     let checksum = match (local_addr.ip(), peer_addr.ip()) {
-        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => pnet_packet::util::ipv4_checksum(
-            &bytes,
-            8,
-            &[],
-            &src_ip,
-            &dst_ip,
-            IpNextHeaderProtocols::Tcp,
-        ),
-        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => pnet_packet::util::ipv6_checksum(
-            &bytes,
-            8,
-            &[],
-            &src_ip,
-            &dst_ip,
-            IpNextHeaderProtocols::Tcp,
-        ),
+        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
+            pnet_packet::util::ipv4_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+        }
+        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
+            pnet_packet::util::ipv6_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+        }
         (_, _) => {
             unreachable!()
         }
@@ -397,13 +372,7 @@ struct Common {
 }
 
 impl Common {
-    fn new_syn_received(
-        local_addr: SocketAddr,
-        peer_addr: SocketAddr,
-        seq: u32,
-        wnd: u16,
-        mtu: u16,
-    ) -> Self {
+    fn new_syn_received(local_addr: SocketAddr, peer_addr: SocketAddr, seq: u32, wnd: u16, mtu: u16) -> Self {
         let snd_seq = SeqNum(rand::thread_rng().next_u32());
         Self {
             server: true,
@@ -420,28 +389,14 @@ impl Common {
     }
     fn create_transport_packet(&self, flags: u8, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, self.snd_seq.0, payload);
-        TransportPacket::new(
-            data,
-            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
-        )
+        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
     }
     fn create_transport_packet_seq(&self, flags: u8, seq: u32, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, seq, payload);
-        TransportPacket::new(
-            data,
-            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
-        )
+        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
     }
     fn create_packet(&self, flags: u8, seq: u32, payload: &[u8]) -> BytesMut {
-        create_packet_raw(
-            &self.local_addr,
-            &self.peer_addr,
-            seq,
-            self.snd_ack.0,
-            self.rcv_wnd,
-            flags,
-            payload,
-        )
+        create_packet_raw(&self.local_addr, &self.peer_addr, seq, self.snd_ack.0, self.rcv_wnd, flags, payload)
     }
     fn snd_seq(&self) -> u32 {
         self.snd_seq.0
@@ -518,9 +473,7 @@ impl TcbWrite {
         if offset == 0 {
             return None;
         }
-        let packet = self
-            .common
-            .create_transport_packet_seq(PSH | ACK, seq, &buf[..offset]);
+        let packet = self.common.create_transport_packet_seq(PSH | ACK, seq, &buf[..offset]);
         Some((packet, offset))
     }
     fn take_send_buf(&mut self) -> Option<InflightPacket> {
@@ -540,10 +493,7 @@ impl TcbWrite {
         for packet in self.inflight_packets.iter() {
             if packet.seq == back_seq.0 {
                 self.back_seq.replace(back_seq.add_num(packet.len() as u32));
-                return Some(
-                    self.common
-                        .create_transport_packet(PSH | ACK, packet.bytes()),
-                );
+                return Some(self.common.create_transport_packet(PSH | ACK, packet.bytes()));
             }
         }
         self.back_seq.take();
@@ -586,9 +536,7 @@ impl PartialOrd for SeqNum {
 
 impl Ord for SeqNum {
     fn cmp(&self, other: &Self) -> Ordering {
-        let a = self.0;
-        let b = other.0;
-        let diff = a.wrapping_sub(b);
+        let diff = self.0.wrapping_sub(other.0);
         if diff == 0 {
             Ordering::Equal
         } else if diff < MAX_DIFF {

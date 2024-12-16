@@ -1,10 +1,4 @@
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::io;
-use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+#![allow(dead_code)]
 
 use bytes::BytesMut;
 use dashmap::{DashMap, Entry};
@@ -12,11 +6,17 @@ use parking_lot::Mutex;
 use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet_packet::Packet;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::io;
+use std::io::Error;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 
-pub(crate) const UNSPECIFIED_ADDR: SocketAddr =
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+pub(crate) const UNSPECIFIED_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 #[derive(Copy, Clone)]
 pub struct IpStackConfig {
@@ -36,46 +36,25 @@ impl IpStackConfig {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "mtu<68"));
         }
         if self.ip_fragment_timeout.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ip_fragment_timeout is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_fragment_timeout is zero"));
         }
         if self.retransmission_timeout.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "retransmission_timeout is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "retransmission_timeout is zero"));
         }
         if self.channel_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "channel_size is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "channel_size is zero"));
         }
         if self.tcp_syn_channel_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tcp_syn_channel_size is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tcp_syn_channel_size is zero"));
         }
         if self.tcp_channel_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tcp_channel_size is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tcp_channel_size is zero"));
         }
         if self.udp_channel_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "udp_channel_size is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "udp_channel_size is zero"));
         }
         if self.icmp_channel_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "icmp_channel_size is zero",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "icmp_channel_size is zero"));
         }
         Ok(())
     }
@@ -174,12 +153,7 @@ pub struct IdKey {
 }
 
 impl IdKey {
-    pub fn new(
-        src: IpAddr,
-        dst: IpAddr,
-        protocol: IpNextHeaderProtocol,
-        identification: u16,
-    ) -> Self {
+    pub fn new(src: IpAddr, dst: IpAddr, protocol: IpNextHeaderProtocol, identification: u16) -> Self {
         Self {
             src,
             dst,
@@ -214,11 +188,7 @@ pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpSt
     Ok((ip_stack, ip_stack_send, ip_stack_recv))
 }
 
-async fn loop_check_timeouts(
-    timeout: Duration,
-    ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>,
-    notify: Arc<Notify>,
-) {
+async fn loop_check_timeouts(timeout: Duration, ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>, notify: Arc<Notify>) {
     let notified = notify.notified();
     tokio::pin!(notified);
     loop {
@@ -262,30 +232,18 @@ impl IpStack {
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
         match protocol {
-            IpNextHeaderProtocols::Udp => {
-                Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender)
-            }
-            IpNextHeaderProtocols::Icmp => {
-                Self::add_socket0(&self.inner.icmp_socket_map, local_addr, packet_sender)
-            }
+            IpNextHeaderProtocols::Udp => Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender),
+            IpNextHeaderProtocols::Icmp => Self::add_socket0(&self.inner.icmp_socket_map, local_addr, packet_sender),
             _ => Err(io::Error::from(io::ErrorKind::Unsupported)),
         }
     }
-    pub(crate) fn add_tcp_listener(
-        &self,
-        local_addr: SocketAddr,
-        packet_sender: Sender<TransportPacket>,
-    ) -> io::Result<()> {
+    pub(crate) fn add_tcp_listener(&self, local_addr: SocketAddr, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner.tcp_listener_map, local_addr, packet_sender)
     }
     pub(crate) fn remove_tcp_listener(&self, local_addr: &SocketAddr) {
         self.inner.tcp_listener_map.remove(local_addr);
     }
-    pub(crate) fn add_tcp_socket(
-        &self,
-        network_tuple: NetworkTuple,
-        packet_sender: Sender<TransportPacket>,
-    ) -> io::Result<()> {
+    pub(crate) fn add_tcp_socket(&self, network_tuple: NetworkTuple, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner.tcp_stream_map, network_tuple, packet_sender)
     }
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
@@ -302,11 +260,7 @@ impl IpStack {
             _ => {}
         }
     }
-    fn add_socket0<K: Eq + PartialEq + Hash, V>(
-        map: &DashMap<K, V>,
-        local_addr: K,
-        packet_sender: V,
-    ) -> io::Result<()> {
+    fn add_socket0<K: Eq + PartialEq + Hash, V>(map: &DashMap<K, V>, local_addr: K, packet_sender: V) -> io::Result<()> {
         let entry = map.entry(local_addr);
         match entry {
             Entry::Occupied(_entry) => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
@@ -342,17 +296,10 @@ impl IpStackSend {
                     IpNextHeaderProtocols::Tcp => self.get_tcp_sender(network_tuple),
                     IpNextHeaderProtocols::Udp => self.get_udp_sender(network_tuple),
                     IpNextHeaderProtocols::Icmp => self.get_icmp_sender(network_tuple),
-                    protocol => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!("protocol={protocol}"),
-                        ))
-                    }
+                    protocol => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("protocol={protocol}"))),
                 };
                 if let Some(sender) = sender {
-                    let rs = self
-                        .transmit_ip_packet(sender, packet, id_key, network_tuple)
-                        .await;
+                    let rs = self.transmit_ip_packet(sender, packet, id_key, network_tuple).await;
                     if rs.is_err() {
                         self.clear_fragment_cache(&id_key);
                     }
@@ -366,10 +313,7 @@ impl IpStackSend {
             _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
         }
     }
-    fn get_tcp_sender(
-        &mut self,
-        network_tuple: NetworkTuple,
-    ) -> Option<SenderBox<TransportPacket>> {
+    fn get_tcp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(tcp) = stack.tcp_stream_map.get(&network_tuple) {
             Some(SenderBox::MPSC(tcp.value().clone()))
@@ -387,10 +331,7 @@ impl IpStackSend {
             }
         }
     }
-    fn get_udp_sender(
-        &mut self,
-        network_tuple: NetworkTuple,
-    ) -> Option<SenderBox<TransportPacket>> {
+    fn get_udp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(udp) = stack.udp_socket_map.get(&network_tuple.dst) {
             Some(SenderBox::MPMC(udp.value().clone()))
@@ -406,10 +347,7 @@ impl IpStackSend {
             }
         }
     }
-    fn get_icmp_sender(
-        &mut self,
-        network_tuple: NetworkTuple,
-    ) -> Option<SenderBox<TransportPacket>> {
+    fn get_icmp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(icmp) = stack.icmp_socket_map.get(&network_tuple.dst) {
             Some(SenderBox::MPMC(icmp.value().clone()))
@@ -432,8 +370,7 @@ impl IpStackSend {
         id_key: IdKey,
         network_tuple: NetworkTuple,
     ) -> io::Result<()> {
-        let more_fragments =
-            packet.get_flags() & Ipv4Flags::MoreFragments == Ipv4Flags::MoreFragments;
+        let more_fragments = packet.get_flags() & Ipv4Flags::MoreFragments == Ipv4Flags::MoreFragments;
         let offset = packet.get_fragment_offset() as u16;
         let segmented = more_fragments || offset > 0;
         let buf = if segmented {
@@ -452,28 +389,21 @@ impl IpStackSend {
         _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
         Ok(())
     }
-    fn prepare_ip_fragments(
-        &mut self,
-        ip_packet: &Ipv4Packet<'_>,
-        id_key: IdKey,
-    ) -> io::Result<Option<NetworkTuple>> {
+    fn prepare_ip_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
         let offset = ip_packet.get_fragment_offset() as u16;
         let network_tuple = if offset == 0 {
             // No segmentation or the first segmentation
             convert_network_tuple(&ip_packet)?
         } else {
             let mut guard = self.ident_fragments_map.lock();
-            let p = guard
-                .entry(id_key)
-                .or_insert_with(|| IpFragments::default());
+            let p = guard.entry(id_key).or_insert_with(|| IpFragments::default());
 
             if let Some(v) = p.network_tuple {
                 v
             } else {
                 // Perhaps the first IP segment has not yet arrived,
                 // so the network tuple cannot be obtained.
-                let last_fragment =
-                    ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
+                let last_fragment = ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
                 p.add_fragment(ip_packet.into(), last_fragment)?;
                 return Ok(None);
             }
@@ -492,8 +422,7 @@ impl IpStackSend {
             .and_modify(|p| p.update_time())
             .or_insert_with(|| IpFragments::new(network_tuple));
 
-        let last_fragment =
-            ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
+        let last_fragment = ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
         let offset = ip_packet.get_fragment_offset() << 3;
         if last_fragment {
             ip_fragments.last_offset.replace(offset);
@@ -503,18 +432,15 @@ impl IpStackSend {
         if ip_fragments.is_complete() {
             //This place cannot be None
             let mut fragments = map.remove(&id_key).unwrap();
-            fragments.bufs.sort_by(|ip_fragment1, ip_fragment2| {
-                ip_fragment1.offset.cmp(&ip_fragment2.offset)
-            });
+            fragments
+                .bufs
+                .sort_by(|ip_fragment1, ip_fragment2| ip_fragment1.offset.cmp(&ip_fragment2.offset));
             let mut total_payload_len = 0;
             for ip_fragment in &fragments.bufs {
                 if total_payload_len as u16 != ip_fragment.offset {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "fragment offset error:{total_payload_len}!={}",
-                            ip_fragment.offset
-                        ),
+                        format!("fragment offset error:{total_payload_len}!={}", ip_fragment.offset),
                     ));
                 }
                 total_payload_len += ip_fragment.payload.len();
@@ -535,28 +461,16 @@ impl IpStackSend {
 }
 
 impl IpStackRecv {
-    pub async fn recv_ip_packet<B: AsMut<[u8]>>(
-        &mut self,
-        bufs: &mut [B],
-        sizes: &mut [usize],
-    ) -> io::Result<usize> {
+    pub async fn recv_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize]) -> io::Result<usize> {
         if let Some(packet) = self.packet_receiver.recv().await {
             self.split_ip_packet(bufs, sizes, packet)
         } else {
             Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"))
         }
     }
-    fn split_ip_packet<B: AsMut<[u8]>>(
-        &mut self,
-        bufs: &mut [B],
-        sizes: &mut [usize],
-        packet: TransportPacket,
-    ) -> io::Result<usize> {
+    fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
         if bufs.len() != sizes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bufs.len!=sizes.len",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs.len!=sizes.len"));
         }
         let mtu = self.ip_stack.config.mtu;
         self.identification = self.identification.wrapping_sub(1);
@@ -586,19 +500,13 @@ impl IpStackRecv {
             };
             let total_length = IPV4_HEADER_SIZE + fragment_size;
             if total_packets >= bufs.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "bufs too short",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs too short"));
             }
             let buf = bufs[total_packets].as_mut();
             if total_length > buf.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "bufs[{total_packets}] too short.{total_length}>{:?}",
-                        buf.len()
-                    ),
+                    format!("bufs[{total_packets}] too short.{total_length}>{:?}", buf.len()),
                 ));
             }
             let more_fragments = if remaining > fragment_size { 1 } else { 0 };
@@ -690,14 +598,9 @@ impl IpFragments {
     }
     fn add_fragment(&mut self, ip_fragment: IpFragment, last_fragment: bool) -> io::Result<()> {
         if !last_fragment {
-            let (read_len, overflow) = self
-                .read_len
-                .overflowing_add(ip_fragment.payload.len() as u16);
+            let (read_len, overflow) = self.read_len.overflowing_add(ip_fragment.payload.len() as u16);
             if overflow {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IP segment length overflow",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "IP segment length overflow"));
             }
             self.read_len = read_len;
         }
@@ -731,12 +634,7 @@ pub fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
             (udp_packet.get_source(), udp_packet.get_destination())
         }
         IpNextHeaderProtocols::Icmp => (0, 0),
-        protocol => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("protocol={protocol}"),
-            ))
-        }
+        protocol => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("protocol={protocol}"))),
     };
 
     let src_addr = SocketAddrV4::new(src_ip, src_port);
