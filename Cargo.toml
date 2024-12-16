@@ -1,0 +1,35 @@
+[package]
+name = "tcp_ip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+tokio = { version = "1.42", features = ["full"] }
+bytes = "1.9"
+pnet_packet = "0.35"
+dashmap = "6.1"
+log = "0.4"
+flume = {version = "0.11",features = ["async"]}
+rand = "0.8"
+parking_lot = "0.12"
+crossbeam = "0.8.4"
+tokio-util = "0.7.13"
+
+[dev-dependencies]
+anyhow = "1"
+env_logger = "0.11"
+tun-rs = {version = "=1.4.9",features = ["async"]}
+packet = "0.1"
+
+[[example]]
+name = "tcp"
+
+[[example]]
+name = "udp"
+
+[[example]]
+name = "icmp"
+
+[[example]]
+name = "tcp-proxy"
