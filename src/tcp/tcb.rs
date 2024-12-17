@@ -620,6 +620,12 @@ impl TcbWrite {
     pub fn no_inflight_packet(&self) -> bool {
         self.inflight_packets.is_empty()
     }
+    pub fn full(&self) -> bool {
+        self.inflight_packets.len() == MAX_PACKETS
+    }
+    pub fn decelerate(&self) -> bool {
+        self.inflight_packets.len() >= MAX_PACKETS / 2
+    }
     pub fn inflight_packet(&self) -> usize {
         self.inflight_packets.iter().map(|v| v.buf.len()).sum()
     }

@@ -253,12 +253,11 @@ impl TcpStreamWrite {
             if !retransmission && !self.try_write().await? && snd_ack_distance > 0 {
                 self.send_ack().await?;
             }
-            if retransmission || self.last_buffer.is_some() {
-                log::info!(
-                    "loop_send {snd_ack_distance} {retransmission},{} {}",
-                    self.last_buffer.is_some(),
-                    self.tcb_write.inflight_packet()
-                );
+            if self.tcb_write.decelerate() {
+                // todo Need for more efficient flow control
+                for _ in 0..1000 {
+                    tokio::task::yield_now().await;
+                }
             }
             if retransmission || self.last_buffer.is_some() {
                 let deadline = tokio::time::Instant::now() + timeout;
