@@ -19,7 +19,8 @@ tokio-util = "0.7.13"
 anyhow = "1"
 env_logger = "0.11"
 packet = "0.1"
-tun-rs = { version = "=1.4.9", features = ["async"] }
+tun-rs = { version = "1.5.0", features = ["async"] }
+clap = { version = "4", features = ["derive"] }
 
 [[example]]
 name = "tcp"

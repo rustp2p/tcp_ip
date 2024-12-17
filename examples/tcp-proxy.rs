@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use clap::Parser;
 use pnet_packet::Packet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun_rs::{AsyncDevice, Configuration};
@@ -10,10 +11,15 @@ use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 use tcp_ip::tcp::TcpListener;
 
 const MTU: u16 = 1420;
-
+#[derive(Parser)]
+pub struct Args {
+    #[arg(short, long)]
+    server_addr: SocketAddr,
+}
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    let server_addr: SocketAddr = "172.19.29.190:5201".parse().unwrap();
+    let args = Args::parse();
+    let server_addr = args.server_addr;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut config = Configuration::default();
 
@@ -37,8 +43,8 @@ pub async fn main() -> anyhow::Result<()> {
             log::info!("tcp_stream addr:{addr}");
             let mut server_stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
             tokio::spawn(async move {
-                let mut buf1 = [0; 65536];
-                let mut buf2 = [0; 65536];
+                let mut buf1 = [0; 2048];
+                let mut buf2 = [0; 2048];
                 loop {
                     tokio::select! {
                         rs=tcp_stream.read(&mut buf1)=>{

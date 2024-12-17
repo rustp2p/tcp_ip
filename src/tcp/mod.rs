@@ -4,7 +4,7 @@ use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket, UNSPECIFIED_ADDR};
 use crate::tcp::tcb::{Tcb, TcbRead, TcbWrite};
 use bytes::{Buf, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::tcp::TcpFlags::{ACK, PSH, RST, SYN};
+use pnet_packet::tcp::TcpFlags::{ACK, RST, SYN};
 use std::collections::HashMap;
 use std::io;
 use std::io::Error;
@@ -65,16 +65,11 @@ impl TcpListener {
                 let peer_addr = network_tuple.src;
                 if tcp_packet.get_flags() & SYN == SYN {
                     // LISTEN -> SYN_RECEIVED
-                    let tcb = Tcb::new_syn_received(
-                        local_addr,
-                        peer_addr,
-                        tcp_packet.get_sequence(),
-                        tcp_packet.get_window(),
-                        self.ip_stack.config.mtu,
-                    );
-                    let data = tcb.create_transport_packet(SYN | ACK, &[]);
-                    self.ip_stack.send_packet(data).await?;
-                    self.tcb_map.insert(*network_tuple, tcb);
+                    let mut tcb = Tcb::new_listen(local_addr, peer_addr, self.ip_stack.config.mtu);
+                    if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
+                        self.ip_stack.send_packet(relay_packet).await?;
+                        self.tcb_map.insert(*network_tuple, tcb);
+                    }
                 } else if let Some(tcb) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
                     if tcb.try_established(packet.buf) {
@@ -169,25 +164,33 @@ impl TcpStreamRead {
             self.update_state();
 
             self.tcb_read.push_packet(packet.buf);
-            let mut buffer = BytesMut::zeroed(2048);
-            let len = self.tcb_read.read(&mut buffer);
-            buffer.truncate(len);
-            if !buffer.is_empty() {
-                match self.payload_sender.send(buffer).await {
-                    Ok(_) => {}
-                    Err(_e) => {
-                        // todo shutdown
-                        log::error!("close");
-                        break;
+            let len = self.tcb_read.readable();
+            if len > 0 {
+                let mut buffer = BytesMut::zeroed(len);
+                let len = self.tcb_read.read(&mut buffer);
+                self.update_and_notify();
+                buffer.truncate(len);
+                if !buffer.is_empty() {
+                    match self.payload_sender.send(buffer).await {
+                        Ok(_) => {}
+                        Err(_e) => {
+                            // todo shutdown
+                            log::error!("close");
+                            break;
+                        }
                     }
                 }
-            }
-            let snd_ack_distance = self.update_context();
-            if snd_ack_distance > 0 {
-                // Notify sending ack
-                self.tcp_context.notify_write.notify_one();
+            } else {
+                self.update_and_notify();
             }
             // todo 减少接收窗口
+        }
+    }
+    fn update_and_notify(&self) {
+        let snd_ack_distance = self.update_context();
+        if snd_ack_distance > 0 {
+            // Notify sending ack
+            self.tcp_context.notify_write.notify_one();
         }
     }
 
@@ -250,7 +253,13 @@ impl TcpStreamWrite {
             if !retransmission && !self.try_write().await? && snd_ack_distance > 0 {
                 self.send_ack().await?;
             }
-
+            if retransmission || self.last_buffer.is_some() {
+                log::info!(
+                    "loop_send {snd_ack_distance} {retransmission},{} {}",
+                    self.last_buffer.is_some(),
+                    self.tcb_write.inflight_packet()
+                );
+            }
             if retransmission || self.last_buffer.is_some() {
                 let deadline = tokio::time::Instant::now() + timeout;
                 sleep.as_mut().reset(deadline);
@@ -301,15 +310,13 @@ impl TcpStreamWrite {
     }
     async fn try_write(&mut self) -> io::Result<bool> {
         if let Some(buf) = self.last_buffer.as_mut() {
-            if let Some((packet, len)) = self.tcb_write.write(&buf) {
-                self.ip_stack.send_packet(packet).await?;
-                if buf.len() == len {
-                    self.last_buffer.take();
-                } else {
-                    buf.advance(len);
-                }
-                self.update_seq();
+            let len = Self::write_slice0(&mut self.tcb_write, &self.ip_stack, &self.tcp_context, buf).await?;
+            if buf.len() == len {
+                self.last_buffer.take();
+            } else {
+                buf.advance(len);
             }
+            self.update_seq();
             return Ok(true);
         }
         if self.tcb_write.no_inflight_packet() {
@@ -320,34 +327,64 @@ impl TcpStreamWrite {
         }
         Ok(false)
     }
+    async fn write_slice0(
+        tcb_write: &mut TcbWrite,
+        ip_stack: &IpStack,
+        tcp_context: &Arc<TcpContext>,
+        mut buf: &[u8],
+    ) -> io::Result<usize> {
+        let len = buf.len();
+        let mut try_again = false;
+        while !buf.is_empty() {
+            if let Some((packet, len)) = tcb_write.write(&buf) {
+                if len == 0 {
+                    if !try_again {
+                        try_again = true;
+                        Self::update_state0(tcb_write, tcp_context);
+                        continue;
+                    }
+                    break;
+                }
+                ip_stack.send_packet(packet).await?;
+                buf = &buf[len..];
+            }
+        }
+        Ok(len - buf.len())
+    }
+    async fn write_slice(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Self::write_slice0(&mut self.tcb_write, &self.ip_stack, &self.tcp_context, buf).await
+    }
     async fn send_ack(&self) -> io::Result<()> {
-        let packet = self.tcb_write.create_transport_packet(PSH | ACK, &[]);
+        let packet = self.tcb_write.create_transport_packet(ACK, &[]);
         self.ip_stack.send_packet(packet).await
     }
     async fn write(&mut self, mut buf: BytesMut) -> io::Result<usize> {
-        if let Some((packet, len)) = self.tcb_write.write(&buf) {
-            self.ip_stack.send_packet(packet).await?;
-            if len != buf.len() {
-                // Buffer is full
-                buf.advance(len);
-                self.last_buffer.replace(buf);
-            }
-            self.update_seq();
-            Ok(len)
-        } else {
-            Ok(0)
+        let len = self.write_slice(&buf).await?;
+        if len != buf.len() {
+            // Buffer is full
+            buf.advance(len);
+            self.last_buffer.replace(buf);
         }
+        self.update_seq();
+        Ok(len)
     }
     fn update_state(&mut self) -> u32 {
-        let snd_ack = self.tcp_context.snd_ack();
-        let last_ack = self.tcp_context.last_ack();
-        let rcv_wnd = self.tcp_context.rcv_wnd();
-        let snd_ack_distance = snd_ack.wrapping_sub(self.tcb_write.snd_ack());
-        self.tcb_write.update_last_ack(last_ack);
-        self.tcb_write.update_snd_ack(snd_ack);
-        self.tcb_write.update_rcv_wnd(rcv_wnd);
+        Self::update_state0(&mut self.tcb_write, &self.tcp_context)
+    }
+    fn update_state0(tcb_write: &mut TcbWrite, tcp_context: &Arc<TcpContext>) -> u32 {
+        let snd_ack = tcp_context.snd_ack();
+        let last_ack = tcp_context.last_ack();
+        let rcv_wnd = tcp_context.rcv_wnd();
+        let snd_wnd = tcp_context.snd_wnd();
+
+        let snd_ack_distance = snd_ack.wrapping_sub(tcb_write.snd_ack());
+        tcb_write.update_last_ack(last_ack);
+        tcb_write.update_snd_ack(snd_ack);
+        tcb_write.update_rcv_wnd(rcv_wnd);
+        tcb_write.update_snd_wnd(snd_wnd);
         snd_ack_distance
     }
+
     fn update_seq(&self) {
         let snd_seq = self.tcb_write.snd_seq();
         self.tcp_context.set_snd_seq(snd_seq);
