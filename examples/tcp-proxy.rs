@@ -4,7 +4,6 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use clap::Parser;
 use pnet_packet::Packet;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun_rs::{AsyncDevice, Configuration};
 
 use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
@@ -33,7 +32,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let h1 = tokio::spawn(async move {
         loop {
-            let (mut tcp_stream, addr) = match tcp_listener.accept().await {
+            let (tcp_stream, addr) = match tcp_listener.accept().await {
                 Ok(rs) => rs,
                 Err(e) => {
                     log::error!("tcp_listener accept {e:?}");
@@ -41,50 +40,15 @@ pub async fn main() -> anyhow::Result<()> {
                 }
             };
             log::info!("tcp_stream addr:{addr}");
-            let mut server_stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+            let server_stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+
             tokio::spawn(async move {
-                let mut buf1 = [0; 2048];
-                let mut buf2 = [0; 2048];
-                loop {
-                    tokio::select! {
-                        rs=tcp_stream.read(&mut buf1)=>{
-                            match rs {
-                                Ok(len) => {
-                                    if len==0{
-                                        log::error!("tcp_stream read 0");
-                                        break;
-                                    }
-                                    if let Err(e) = server_stream.write_all(&buf1[..len]).await {
-                                        log::error!("server_stream write {e:?}");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("tcp_stream read {e:?}");
-                                    break;
-                                }
-                            }
-                        }
-                        rs=server_stream.read(&mut buf2)=>{
-                            match rs {
-                                Ok(len) => {
-                                    if len==0{
-                                        log::error!("server_stream read 0");
-                                        break;
-                                    }
-                                    if let Err(e) = tcp_stream.write_all(&buf2[..len]).await {
-                                        log::error!("tcp_stream write {e:?}");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("server_stream read {e:?}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                let (mut client_write, mut client_read) = tcp_stream.split();
+                let (mut server_read, mut server_write) = server_stream.into_split();
+                let h1 = tokio::io::copy(&mut client_read, &mut server_write);
+                let h2 = tokio::io::copy(&mut server_read, &mut client_write);
+                let rs = tokio::join!(h1, h2);
+                log::info!("copy rs:{rs:?}");
             });
         }
     });

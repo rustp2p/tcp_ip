@@ -12,7 +12,7 @@ const MTU: u16 = 1420;
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut config = Configuration::default();
 
     config.mtu(MTU).address_with_prefix((10, 0, 0, 29), 24).up();

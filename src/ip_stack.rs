@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 pub(crate) const UNSPECIFIED_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct IpStackConfig {
     pub mtu: u16,
     pub ip_fragment_timeout: Duration,
@@ -75,12 +75,13 @@ impl Default for IpStackConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IpStack {
     pub(crate) config: IpStackConfig,
     pub(crate) inner: Arc<IpStackInner>,
 }
 
+#[derive(Debug)]
 pub(crate) struct IpStackInner {
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<SocketAddr, Sender<TransportPacket>>,

@@ -2,6 +2,10 @@
 name = "tcp_ip"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+description = "User-space TCP/IP stack"
+repository = "https://github.com/rustp2p/tcp_ip"
 
 [dependencies]
 bytes = "1.9"
@@ -14,6 +18,7 @@ pnet_packet = "0.35"
 rand = "0.8"
 tokio = { version = "1.42", features = ["full"] }
 tokio-util = "0.7.13"
+num_enum = "0.7.3"
 
 [dev-dependencies]
 anyhow = "1"
