@@ -22,7 +22,7 @@ pub(crate) const UNSPECIFIED_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new
 pub struct IpStackConfig {
     pub mtu: u16,
     pub ip_fragment_timeout: Duration,
-    pub retransmission_timeout: Duration,
+    pub tcp_config: crate::tcp::TcpConfig,
     pub channel_size: usize,
     pub tcp_syn_channel_size: usize,
     pub tcp_channel_size: usize,
@@ -38,9 +38,7 @@ impl IpStackConfig {
         if self.ip_fragment_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_fragment_timeout is zero"));
         }
-        if self.retransmission_timeout.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "retransmission_timeout is zero"));
-        }
+
         if self.channel_size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "channel_size is zero"));
         }
@@ -56,7 +54,7 @@ impl IpStackConfig {
         if self.icmp_channel_size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "icmp_channel_size is zero"));
         }
-        Ok(())
+        self.tcp_config.check()
     }
 }
 
@@ -65,7 +63,7 @@ impl Default for IpStackConfig {
         Self {
             mtu: 1500,
             ip_fragment_timeout: Duration::from_secs(10),
-            retransmission_timeout: Duration::from_millis(200),
+            tcp_config: Default::default(),
             channel_size: 128,
             tcp_syn_channel_size: 128,
             tcp_channel_size: 128,

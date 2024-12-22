@@ -9,6 +9,7 @@ use pnet_packet::Packet;
 use rand::RngCore;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, LinkedList, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Add, Sub};
 use std::time::{Duration, Instant};
@@ -64,7 +65,8 @@ pub struct Tcb {
     snd_wnd: u16,
     rcv_wnd: u16,
     mss: u16,
-    window_shift_cnt: u8,
+    snd_window_shift_cnt: u8,
+    rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
     ordered_packets: LinkedList<UnreadPacket>,
     unordered_packets: TcpOfoQueue<UnreadPacket>,
@@ -214,9 +216,38 @@ impl InflightPacket {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TcpConfig {
+    pub retransmission_timeout: Duration,
+    pub mss: u16,
+    pub window_shift_cnt: u8,
+}
+
+impl Default for TcpConfig {
+    fn default() -> Self {
+        Self {
+            retransmission_timeout: Duration::from_millis(1000),
+            mss: 536,
+            window_shift_cnt: 0,
+        }
+    }
+}
+
+impl TcpConfig {
+    pub fn check(&self) -> io::Result<()> {
+        if self.mss < 536 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "mss cannot be less than 536"));
+        }
+        if self.retransmission_timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "retransmission_timeout is zero"));
+        }
+        Ok(())
+    }
+}
+
 /// Implementation related to initialization connection
 impl Tcb {
-    pub fn new_listen(local_addr: SocketAddr, peer_addr: SocketAddr, retransmission_timeout: Duration) -> Self {
+    pub fn new_listen(local_addr: SocketAddr, peer_addr: SocketAddr, config: TcpConfig) -> Self {
         let snd_seq = SeqNum::from(rand::thread_rng().next_u32());
         Self {
             state: TcpState::Listen,
@@ -228,8 +259,9 @@ impl Tcb {
             snd_wnd: 0,
             rcv_wnd: u16::MAX,
             rcv_ack: snd_seq,
-            mss: 536,
-            window_shift_cnt: 0,
+            mss: config.mss,
+            snd_window_shift_cnt: 0,
+            rcv_window_shift_cnt: config.window_shift_cnt,
             duplicate_ack_count: 0,
             // rcv_seq: SeqNum(0),
             ordered_packets: Default::default(),
@@ -238,8 +270,18 @@ impl Tcb {
             inflight_packets: Default::default(),
             time_wait: None,
             write_timeout: None,
-            retransmission_timeout,
+            retransmission_timeout: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
+        }
+    }
+    pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
+        if self.state == TcpState::Listen || self.state == TcpState::SynSent {
+            self.sent_syn();
+            let options = self.get_options();
+            let packet = self.create_option_transport_packet(SYN, &[], Some(&options));
+            Some(packet)
+        } else {
+            None
         }
     }
     pub fn try_syn_received(&mut self, tcp_packet: &TcpPacket<'_>) -> Option<TransportPacket> {
@@ -262,8 +304,9 @@ impl Tcb {
             None
         }
     }
-    pub fn try_established(&mut self, mut buf: BytesMut) -> bool {
+    pub fn try_syn_received_to_established(&mut self, mut buf: BytesMut) -> bool {
         let Some(packet) = TcpPacket::new(&buf) else {
+            self.error();
             return false;
         };
         let flags = packet.get_flags();
@@ -277,6 +320,7 @@ impl Tcb {
             if flags & ACK == ACK && self.snd_ack.0 == packet.get_sequence() && self.snd_seq.add_num(1).0 == packet.get_acknowledgement() {
                 self.snd_wnd = packet.get_window();
                 self.snd_seq = SeqNum(packet.get_acknowledgement());
+                self.rcv_ack = SeqNum(packet.get_acknowledgement());
                 self.recv_syn_ack();
                 if !packet.payload().is_empty() {
                     let seq = SeqNum(packet.get_sequence());
@@ -287,6 +331,26 @@ impl Tcb {
             }
         }
         false
+    }
+    pub fn try_syn_sent_to_established(&mut self, mut buf: BytesMut) -> Option<TransportPacket> {
+        let Some(packet) = TcpPacket::new(&buf) else {
+            self.error();
+            return None;
+        };
+        let flags = packet.get_flags();
+        if self.state == TcpState::SynSent {
+            if flags & ACK == ACK && flags & SYN == SYN {
+                self.snd_seq.add_update(1);
+                self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
+                self.last_snd_ack = self.snd_ack;
+                self.rcv_ack = SeqNum(packet.get_acknowledgement());
+                self.snd_wnd = packet.get_window();
+                self.recv_syn_ack();
+                let relay = self.create_option_transport_packet(ACK, &[], None);
+                return Some(relay);
+            }
+        }
+        None
     }
 }
 
@@ -305,11 +369,9 @@ impl Tcb {
         options.put_u16(mss);
 
         options.put_u8(TcpOptionNumbers::NOP.0);
-        if self.window_shift_cnt > 0 {
-            options.put_u8(TcpOptionNumbers::WSCALE.0);
-            options.put_u8(3);
-            options.put_u8(self.window_shift_cnt);
-        }
+        options.put_u8(TcpOptionNumbers::WSCALE.0);
+        options.put_u8(3);
+        options.put_u8(self.rcv_window_shift_cnt);
         // todo TCP Option - SACK permitted
         options
     }
@@ -319,7 +381,7 @@ impl Tcb {
             match tcp_option.get_number() {
                 TcpOptionNumbers::WSCALE => {
                     if let Some(window_shift_cnt) = payload.get(0) {
-                        self.window_shift_cnt = (*window_shift_cnt).min(14);
+                        self.snd_window_shift_cnt = (*window_shift_cnt).min(14);
                     }
                 }
                 TcpOptionNumbers::MSS => {
@@ -556,7 +618,7 @@ impl Tcb {
     }
     pub fn send_window(&self) -> usize {
         let distance = self.ack_distance();
-        let snd_wnd = (self.snd_wnd as usize) << self.window_shift_cnt;
+        let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         snd_wnd.saturating_sub(distance as usize)
     }
     pub fn need_ack(&self) -> bool {
@@ -664,12 +726,12 @@ impl Tcb {
     }
     pub fn decelerate(&self) -> bool {
         let distance = self.ack_distance();
-        let snd_wnd = (self.snd_wnd as usize) << self.window_shift_cnt;
+        let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         snd_wnd < 3 * distance as usize
     }
     pub fn limit(&self) -> bool {
         let distance = (self.snd_seq - self.rcv_ack).0;
-        let snd_wnd = (self.snd_wnd as usize) << self.window_shift_cnt;
+        let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         // window_shift_cnt doesn't seem to be effective,
         // Using snd_wnd may cause the other party to not receive it.
         // Perhaps it is because the 'slow start' of TCP congestion control has not been implemented
@@ -716,19 +778,21 @@ impl Tcb {
 
 /// TCP state rotation
 impl Tcb {
-    pub fn sent_syn(&mut self) {
+    fn sent_syn(&mut self) {
         if self.state == TcpState::Listen {
             self.state = TcpState::SynSent
         }
     }
-    pub fn recv_syn(&mut self) {
+    fn recv_syn(&mut self) {
         if self.state == TcpState::Listen {
             self.state = TcpState::SynReceived
         }
     }
-    pub fn recv_syn_ack(&mut self) {
-        if self.state == TcpState::SynReceived {
-            self.state = TcpState::Established
+    fn recv_syn_ack(&mut self) {
+        match self.state {
+            TcpState::SynReceived => self.state = TcpState::Established,
+            TcpState::SynSent => self.state = TcpState::Established,
+            _ => {}
         }
     }
 
@@ -739,7 +803,7 @@ impl Tcb {
             _ => {}
         }
     }
-    pub fn recv_fin(&mut self) {
+    fn recv_fin(&mut self) {
         match self.state {
             TcpState::Established => {
                 self.snd_ack.add_update(1);
@@ -757,7 +821,7 @@ impl Tcb {
             _ => {}
         }
     }
-    pub fn recv_fin_ack(&mut self) {
+    fn recv_fin_ack(&mut self) {
         match self.state {
             TcpState::FinWait1 => self.state = TcpState::FinWait2,
             TcpState::Closing => self.state = TcpState::TimeWait,
@@ -765,14 +829,14 @@ impl Tcb {
             _ => {}
         }
     }
-    pub fn recv_rst(&mut self) {
+    fn recv_rst(&mut self) {
         self.state = TcpState::Closed
     }
     fn timeout_wait(&mut self) {
         assert_eq!(self.state, TcpState::TimeWait);
         self.state = TcpState::Closed
     }
-    pub fn error(&mut self) {
+    fn error(&mut self) {
         self.state = TcpState::Closed
     }
     pub fn fin_packet(&self) -> TransportPacket {

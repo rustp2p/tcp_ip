@@ -43,7 +43,7 @@ impl TcpStreamTask {
         application_layer_receiver: Receiver<BytesMut>,
         packet_receiver: Receiver<TransportPacket>,
     ) -> Self {
-        let timeout = ip_stack.config.retransmission_timeout;
+        let timeout = ip_stack.config.tcp_config.retransmission_timeout;
         Self {
             tcb,
             ip_stack,
@@ -89,9 +89,9 @@ impl TcpStreamTask {
 
             let data = if let Some(deadline) = deadline {
                 if self.only_recv_in() {
-                    self.recv_in_timeout(deadline).await
+                    self.recv_in_timeout_at(deadline).await
                 } else {
-                    self.recv_timeout(deadline).await
+                    self.recv_timeout_at(deadline).await
                 }
             } else {
                 if self.only_recv_in() {
@@ -241,7 +241,7 @@ impl TcpStreamTask {
         Ok(())
     }
 
-    async fn recv_timeout(&mut self, deadline: Instant) -> TaskRecvData {
+    async fn recv_timeout_at(&mut self, deadline: Instant) -> TaskRecvData {
         tokio::select! {
             rs=self.packet_receiver.recv()=>{
                 rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
@@ -273,8 +273,13 @@ impl TcpStreamTask {
             },
         }
     }
-    async fn recv_in_timeout(&mut self, deadline: Instant) -> TaskRecvData {
+    async fn recv_in_timeout_at(&mut self, deadline: Instant) -> TaskRecvData {
         tokio::time::timeout_at(deadline, self.recv_in())
+            .await
+            .unwrap_or_else(|_| TaskRecvData::Timeout)
+    }
+    async fn recv_in_timeout(&mut self, duration: Duration) -> TaskRecvData {
+        tokio::time::timeout(duration, self.recv_in())
             .await
             .unwrap_or_else(|_| TaskRecvData::Timeout)
     }
@@ -285,6 +290,35 @@ impl TcpStreamTask {
     async fn recv_out(&mut self) -> TaskRecvData {
         let rs = self.application_layer_receiver.recv().await;
         rs.map(|v| TaskRecvData::Out(v)).unwrap_or(TaskRecvData::OutClose)
+    }
+}
+
+impl TcpStreamTask {
+    pub async fn connect(&mut self) -> io::Result<()> {
+        let mut count = 0;
+        while let Some(packet) = self.tcb.try_syn_sent() {
+            count += 1;
+            if count > 50 {
+                break;
+            }
+            self.ip_stack.send_packet(packet).await?;
+            return match self.recv_in_timeout(Duration::from_millis(5000)).await {
+                TaskRecvData::In(buf) => {
+                    if let Some(relay) = self.tcb.try_syn_sent_to_established(buf) {
+                        self.ip_stack.send_packet(relay).await?;
+                        Ok(())
+                    } else {
+                        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                    }
+                }
+                TaskRecvData::InClose => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                TaskRecvData::Timeout => continue,
+                _ => {
+                    unreachable!()
+                }
+            };
+        }
+        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
     }
 }
 

@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 use tokio_util::sync::PollSender;
 
+pub use tcb::TcpConfig;
 mod sys;
 mod tcb;
 mod tcp_ofo_queue;
@@ -76,15 +77,15 @@ impl TcpListener {
                 let peer_addr = network_tuple.src;
                 if tcp_packet.get_flags() & SYN == SYN {
                     // LISTEN -> SYN_RECEIVED
-                    let retransmission_timeout = self.ip_stack.config.retransmission_timeout;
-                    let mut tcb = Tcb::new_listen(local_addr, peer_addr, retransmission_timeout);
+                    let tcp_config = self.ip_stack.config.tcp_config;
+                    let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
                         self.ip_stack.send_packet(relay_packet).await?;
                         self.tcb_map.insert(*network_tuple, tcb);
                     }
                 } else if let Some(tcb) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
-                    if tcb.try_established(packet.buf) {
+                    if tcb.try_syn_received_to_established(packet.buf) {
                         let tcb = self.tcb_map.remove(network_tuple).unwrap();
                         return Ok((TcpStream::new(self.ip_stack.clone(), tcb)?, peer_addr));
                     }
@@ -112,7 +113,7 @@ impl TcpListener {
 
 impl TcpStream {
     pub async fn connect(ip_stack: IpStack, src: SocketAddr, dest: SocketAddr) -> io::Result<Self> {
-        todo!()
+        Self::connect0(ip_stack, src, dest).await
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
@@ -126,7 +127,36 @@ impl TcpStream {
 }
 
 impl TcpStream {
-    pub(crate) fn new(ip_stack: IpStack, tcb: Tcb) -> io::Result<Self> {
+    pub(crate) async fn connect0(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
+        let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
+        let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size);
+        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
+        let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
+        ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
+        let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
+        let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
+        stream_task.connect().await?;
+        tokio::spawn(async move {
+            if let Err(e) = stream_task.run().await {
+                log::warn!("stream_task run {local_addr}->{peer_addr}: {e:?}")
+            }
+        });
+        let read = TcpStreamReadHalf {
+            last_buf: None,
+            payload_receiver,
+        };
+        let write = TcpStreamWriteHalf {
+            payload_sender: PollSender::new(payload_sender_w),
+        };
+        let stream = Self {
+            local_addr,
+            peer_addr,
+            read,
+            write,
+        };
+        Ok(stream)
+    }
+    pub(crate) fn new0(ip_stack: IpStack, tcb: Tcb) -> io::Result<(Self, TcpStreamTask)> {
         let peer_addr = tcb.peer_addr();
         let local_addr = tcb.local_addr();
         let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
@@ -136,11 +166,6 @@ impl TcpStream {
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
 
         let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
-        tokio::spawn(async move {
-            if let Err(e) = stream_task.run().await {
-                log::warn!("stream_task run {:?}: {e:?}", network_tuple)
-            }
-        });
 
         let read = TcpStreamReadHalf {
             last_buf: None,
@@ -149,12 +174,24 @@ impl TcpStream {
         let write = TcpStreamWriteHalf {
             payload_sender: PollSender::new(payload_sender_w),
         };
-        Ok(Self {
+        let stream = Self {
             local_addr,
             peer_addr,
             read,
             write,
-        })
+        };
+        Ok((stream, stream_task))
+    }
+    pub(crate) fn new(ip_stack: IpStack, tcb: Tcb) -> io::Result<Self> {
+        let peer_addr = tcb.peer_addr();
+        let local_addr = tcb.local_addr();
+        let (stream, mut stream_task) = Self::new0(ip_stack, tcb)?;
+        tokio::spawn(async move {
+            if let Err(e) = stream_task.run().await {
+                log::warn!("stream_task run {local_addr}->{peer_addr}: {e:?}")
+            }
+        });
+        Ok(stream)
     }
 }
 

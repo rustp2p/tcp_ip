@@ -37,4 +37,7 @@ name = "udp"
 name = "icmp"
 
 [[example]]
-name = "tcp-proxy"
+name = "tcp_proxy"
+
+[[example]]
+name = "tcp_connect"
