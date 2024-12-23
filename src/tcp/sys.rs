@@ -70,17 +70,7 @@ impl TcpStreamTask {
             if self.tcb.is_close() {
                 return Ok(());
             }
-            if self.tcb.decelerate() {
-                // todo Need for more efficient flow control
-                let target_duration = Duration::from_micros(100);
-                let start = Instant::now();
-                for _ in 0..1000 {
-                    if start.elapsed() >= target_duration {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
+
             let deadline = if let Some(v) = self.tcb.time_wait() {
                 Some(v.into())
             } else {
@@ -142,6 +132,9 @@ impl TcpStreamTask {
                 self.close_read().await;
             }
         }
+    }
+    pub fn mss(&self) -> u16 {
+        self.tcb.mss()
     }
     fn only_recv_in(&self) -> bool {
         self.retransmission || self.last_buffer.is_some() || self.write_half_closed || self.tcb.limit()

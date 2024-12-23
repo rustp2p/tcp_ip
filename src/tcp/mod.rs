@@ -44,6 +44,7 @@ pub struct TcpStreamReadHalf {
     payload_receiver: Receiver<BytesMut>,
 }
 pub struct TcpStreamWriteHalf {
+    mss: usize,
     payload_sender: PollSender<BytesMut>,
 }
 
@@ -136,6 +137,7 @@ impl TcpStream {
         let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
         let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         stream_task.connect().await?;
+        let mss = stream_task.mss() as usize;
         tokio::spawn(async move {
             if let Err(e) = stream_task.run().await {
                 log::warn!("stream_task run {local_addr}->{peer_addr}: {e:?}")
@@ -146,6 +148,7 @@ impl TcpStream {
             payload_receiver,
         };
         let write = TcpStreamWriteHalf {
+            mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
         let stream = Self {
@@ -164,7 +167,7 @@ impl TcpStream {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
-
+        let mss = tcb.mss() as usize;
         let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
 
         let read = TcpStreamReadHalf {
@@ -172,6 +175,7 @@ impl TcpStream {
             payload_receiver,
         };
         let write = TcpStreamWriteHalf {
+            mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
         let stream = Self {
@@ -251,6 +255,8 @@ impl AsyncWrite for TcpStreamWriteHalf {
         }
         match self.payload_sender.poll_reserve(cx) {
             Poll::Ready(Ok(_)) => {
+                let len = buf.len().min(self.mss);
+                let buf = &buf[..len];
                 _ = self.payload_sender.send_item(buf.into());
                 Poll::Ready(Ok(buf.len()))
             }

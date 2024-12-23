@@ -228,7 +228,7 @@ impl Default for TcpConfig {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
             mss: 536,
-            window_shift_cnt: 0,
+            window_shift_cnt: 6,
         }
     }
 }
@@ -360,6 +360,9 @@ impl Tcb {
     }
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+    pub fn mss(&self) -> u16 {
+        self.mss
     }
     fn get_options(&self) -> BytesMut {
         let mut options = BytesMut::with_capacity(40);
@@ -726,16 +729,16 @@ impl Tcb {
     }
     pub fn decelerate(&self) -> bool {
         let distance = self.ack_distance();
-        let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
-        snd_wnd < 3 * distance as usize
+        let snd_wnd = (self.snd_wnd as usize) /*<< self.snd_window_shift_cnt*/;
+        snd_wnd < distance as usize
     }
     pub fn limit(&self) -> bool {
-        let distance = (self.snd_seq - self.rcv_ack).0;
-        let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
+        let distance = self.ack_distance();
+        let snd_wnd = (self.snd_wnd as usize) /*<< self.snd_window_shift_cnt*/;
         // window_shift_cnt doesn't seem to be effective,
         // Using snd_wnd may cause the other party to not receive it.
         // Perhaps it is because the 'slow start' of TCP congestion control has not been implemented
-        snd_wnd < 2 * distance as usize
+        snd_wnd < distance as usize
     }
     pub fn no_inflight_packet(&self) -> bool {
         self.inflight_packets.is_empty()
