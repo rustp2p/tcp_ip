@@ -24,6 +24,7 @@ pub struct TcpStreamTask {
     read_half_closed: bool,
     write_half_closed: bool,
     retransmission: bool,
+    count: usize,
 }
 
 impl Drop for TcpStreamTask {
@@ -55,6 +56,7 @@ impl TcpStreamTask {
             read_half_closed: false,
             write_half_closed: false,
             retransmission: false,
+            count: 0,
         }
     }
 }
@@ -70,26 +72,8 @@ impl TcpStreamTask {
             if self.tcb.is_close() {
                 return Ok(());
             }
+            let data = self.recv_data().await;
 
-            let deadline = if let Some(v) = self.tcb.time_wait() {
-                Some(v.into())
-            } else {
-                self.tcb.write_timeout().map(|v| v.into())
-            };
-
-            let data = if let Some(deadline) = deadline {
-                if self.only_recv_in() {
-                    self.recv_in_timeout_at(deadline).await
-                } else {
-                    self.recv_timeout_at(deadline).await
-                }
-            } else {
-                if self.only_recv_in() {
-                    self.recv_in().await
-                } else {
-                    self.recv().await
-                }
-            };
             if !self.write_half_closed && !self.retransmission {
                 self.flush().await?;
             }
@@ -128,6 +112,7 @@ impl TcpStreamTask {
                 self.retransmission = false;
                 self.try_send_ack().await?;
             }
+            self.tcb.set_ack();
             if !self.read_half_closed && self.tcb.cannot_read() {
                 self.close_read().await;
             }
@@ -227,7 +212,6 @@ impl TcpStreamTask {
     }
     async fn try_send_ack(&mut self) -> io::Result<()> {
         if self.tcb.need_ack() {
-            self.tcb.set_ack();
             let packet = self.tcb.ack_packet();
             self.ip_stack.send_packet(packet).await?;
         }
@@ -247,6 +231,33 @@ impl TcpStreamTask {
             }
         }
     }
+    async fn recv_data(&mut self) -> TaskRecvData {
+        let deadline = if let Some(v) = self.tcb.time_wait() {
+            Some(v.into())
+        } else {
+            self.tcb.write_timeout().map(|v| v.into())
+        };
+
+        if let Some(deadline) = deadline {
+            if deadline < Instant::now() {
+                TaskRecvData::Timeout
+            } else if self.only_recv_in() {
+                self.recv_in_timeout_at(deadline).await
+            } else if let Some(data) = self.try_recv() {
+                data
+            } else {
+                self.recv_timeout_at(deadline).await
+            }
+        } else {
+            if self.only_recv_in() {
+                self.recv_in().await
+            } else if let Some(data) = self.try_recv() {
+                data
+            } else {
+                self.recv().await
+            }
+        }
+    }
     async fn recv(&mut self) -> TaskRecvData {
         tokio::select! {
             rs=self.packet_receiver.recv()=>{
@@ -257,12 +268,37 @@ impl TcpStreamTask {
             }
         }
     }
+    fn try_recv(&mut self) -> Option<TaskRecvData> {
+        self.count += 1;
+        if self.count & 1 == 1 {
+            let option = self.try_recv_in();
+            if option.is_some() {
+                return option;
+            }
+            self.try_recv_out()
+        } else {
+            let option = self.try_recv_out();
+            if option.is_some() {
+                return option;
+            }
+            self.try_recv_in()
+        }
+    }
     fn try_recv_in(&mut self) -> Option<TaskRecvData> {
         match self.packet_receiver.try_recv() {
             Ok(rs) => Some(TaskRecvData::In(rs.buf)),
             Err(e) => match e {
                 TryRecvError::Empty => None,
                 TryRecvError::Disconnected => Some(TaskRecvData::InClose),
+            },
+        }
+    }
+    fn try_recv_out(&mut self) -> Option<TaskRecvData> {
+        match self.application_layer_receiver.try_recv() {
+            Ok(rs) => Some(TaskRecvData::Out(rs)),
+            Err(e) => match e {
+                TryRecvError::Empty => None,
+                TryRecvError::Disconnected => Some(TaskRecvData::OutClose),
             },
         }
     }

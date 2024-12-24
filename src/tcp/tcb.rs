@@ -65,10 +65,10 @@ pub struct Tcb {
     snd_wnd: u16,
     rcv_wnd: u16,
     mss: u16,
+    sack_permitted: bool,
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
-    ordered_packets: LinkedList<UnreadPacket>,
     unordered_packets: TcpOfoQueue<UnreadPacket>,
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
@@ -76,6 +76,7 @@ pub struct Tcb {
     write_timeout: Option<Instant>,
     retransmission_timeout: Duration,
     timeout_count: (AckNum, usize),
+    congestion_window: CongestionWindow,
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -181,13 +182,19 @@ impl UnreadPacket {
 
 #[derive(Debug)]
 struct InflightPacket {
-    seq: u32,
+    seq: SeqNum,
+    // Need to support SACK
+    confirmed: bool,
     buf: FixedBuffer,
 }
 
 impl InflightPacket {
-    pub fn new(seq: u32, buf: FixedBuffer) -> Self {
-        let mut packet = Self { seq, buf };
+    pub fn new(seq: SeqNum, buf: FixedBuffer) -> Self {
+        let mut packet = Self {
+            seq,
+            confirmed: false,
+            buf,
+        };
         packet.init();
         packet
     }
@@ -199,14 +206,14 @@ impl InflightPacket {
     }
 
     pub fn advance(&mut self, cnt: usize) {
-        self.seq = self.seq.wrapping_add(cnt as u32);
+        self.seq.add_update(cnt as u32);
         self.buf.advance(cnt)
     }
-    pub fn start(&self) -> u32 {
+    pub fn start(&self) -> SeqNum {
         self.seq
     }
-    pub fn end(&self) -> u32 {
-        self.seq.wrapping_add(self.buf.len() as u32)
+    pub fn end(&self) -> SeqNum {
+        self.seq.add_num(self.buf.len() as u32)
     }
     pub fn write(&mut self, buf: &[u8]) -> usize {
         self.buf.extend_from_slice(buf)
@@ -260,11 +267,11 @@ impl Tcb {
             rcv_wnd: u16::MAX,
             rcv_ack: snd_seq,
             mss: config.mss,
+            sack_permitted: false,
             snd_window_shift_cnt: 0,
             rcv_window_shift_cnt: config.window_shift_cnt,
             duplicate_ack_count: 0,
             // rcv_seq: SeqNum(0),
-            ordered_packets: Default::default(),
             unordered_packets: Default::default(),
             back_seq: None,
             inflight_packets: Default::default(),
@@ -272,6 +279,7 @@ impl Tcb {
             write_timeout: None,
             retransmission_timeout: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
+            congestion_window: CongestionWindow::default(),
         }
     }
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
@@ -322,6 +330,7 @@ impl Tcb {
                 self.snd_seq = SeqNum(packet.get_acknowledgement());
                 self.rcv_ack = SeqNum(packet.get_acknowledgement());
                 self.recv_syn_ack();
+                self.init_congestion_window();
                 if !packet.payload().is_empty() {
                     let seq = SeqNum(packet.get_sequence());
                     buf.advance(header_len);
@@ -346,11 +355,17 @@ impl Tcb {
                 self.rcv_ack = SeqNum(packet.get_acknowledgement());
                 self.snd_wnd = packet.get_window();
                 self.recv_syn_ack();
+                self.init_congestion_window();
                 let relay = self.create_option_transport_packet(ACK, &[], None);
                 return Some(relay);
             }
         }
         None
+    }
+    fn init_congestion_window(&mut self) {
+        let initial_cwnd = self.mss as usize * 4;
+        let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
+        self.congestion_window.init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd);
     }
 }
 
@@ -375,7 +390,10 @@ impl Tcb {
         options.put_u8(TcpOptionNumbers::WSCALE.0);
         options.put_u8(3);
         options.put_u8(self.rcv_window_shift_cnt);
-        // todo TCP Option - SACK permitted
+        options.put_u8(TcpOptionNumbers::NOP.0);
+        options.put_u8(TcpOptionNumbers::NOP.0);
+        options.put_u8(TcpOptionNumbers::SACK_PERMITTED.0);
+        options.put_u8(2);
         options
     }
     fn option(&mut self, tcp_packet: &TcpPacket<'_>) {
@@ -392,9 +410,43 @@ impl Tcb {
                         self.mss = (payload[0] as u16) << 8 | (payload[1] as u16);
                     }
                 }
+                TcpOptionNumbers::SACK_PERMITTED => {
+                    // Selective acknowledgements permitted.
+                    self.sack_permitted = true;
+                }
                 TcpOptionNumber(_) => {
                     // todo Handle other options
                 }
+            }
+        }
+    }
+    fn option_sack(&mut self, tcp_packet: &TcpPacket<'_>) {
+        if !self.sack_permitted {
+            return;
+        }
+        for tcp_option in tcp_packet.get_options_iter() {
+            match tcp_option.get_number() {
+                TcpOptionNumbers::SACK => {
+                    let payload = tcp_option.payload();
+                    if payload.len() & 7 != 0 {
+                        continue;
+                    }
+                    let n = payload.len() >> 3;
+                    for inflight_packet in self.inflight_packets.iter_mut() {
+                        for index in 0..n {
+                            let offset = index * 8;
+                            let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                            let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                            if inflight_packet.confirmed || inflight_packet.end() <= left {
+                                break;
+                            }
+                            if inflight_packet.start() >= left && inflight_packet.end() <= right {
+                                inflight_packet.confirmed = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -456,7 +508,8 @@ impl Tcb {
                         }
                     }
 
-                    self.update_last_ack(acknowledgement)
+                    self.update_last_ack(acknowledgement);
+                    self.option_sack(&packet);
                 }
                 let seq = SeqNum(packet.get_sequence());
                 if seq >= self.snd_ack {
@@ -622,7 +675,9 @@ impl Tcb {
     pub fn send_window(&self) -> usize {
         let distance = self.ack_distance();
         let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
-        snd_wnd.saturating_sub(distance as usize)
+        let wnd = self.congestion_window.current_window_size().min(snd_wnd);
+        // log::info!("snd_wnd1 ={snd_wnd1} snd_wnd = {snd_wnd:?},distance={distance}");
+        wnd.saturating_sub(distance as usize)
     }
     pub fn need_ack(&self) -> bool {
         self.snd_ack > self.last_snd_ack
@@ -634,6 +689,7 @@ impl Tcb {
         if ack <= self.rcv_ack {
             return;
         }
+        self.congestion_window.on_ack();
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
         self.rcv_ack = ack;
@@ -654,18 +710,19 @@ impl Tcb {
         if !self.writeable_state() && self.rcv_ack > self.snd_seq {
             self.recv_fin_ack()
         }
+        self.reset_write_timeout();
     }
     fn take_send_buf(&mut self) -> Option<InflightPacket> {
         if self.inflight_packets.len() >= MAX_PACKETS {
             None
         } else {
             let bytes_mut = FixedBuffer::with_capacity(self.mss as usize);
-            Some(InflightPacket::new(self.snd_seq.0, bytes_mut))
+            Some(InflightPacket::new(self.snd_seq, bytes_mut))
         }
     }
     pub fn write(&mut self, buf: &[u8]) -> Option<(TransportPacket, usize)> {
         let rs = self.write0(buf);
-        self.reset_write_timeout();
+        self.init_write_timeout();
         rs
     }
     fn write0(&mut self, mut buf: &[u8]) -> Option<(TransportPacket, usize)> {
@@ -707,13 +764,21 @@ impl Tcb {
             self.write_timeout.replace(Instant::now() + self.retransmission_timeout);
         }
     }
+    fn init_write_timeout(&mut self) {
+        if self.write_timeout.is_none() {
+            self.reset_write_timeout();
+        }
+    }
 
     pub fn retransmission(&mut self) -> Option<TransportPacket> {
         let Some(back_seq) = self.back_seq else {
             return None;
         };
         for packet in self.inflight_packets.iter() {
-            if packet.seq == back_seq.0 {
+            if packet.confirmed {
+                continue;
+            }
+            if packet.seq == back_seq {
                 self.back_seq.replace(back_seq.add_num(packet.len() as u32));
                 return Some(self.create_transport_packet(ACK, packet.bytes()));
             }
@@ -722,23 +787,21 @@ impl Tcb {
         None
     }
     fn back_n(&mut self) {
-        if !self.inflight_packets.is_empty() {
+        if let Some(v) = self.inflight_packets.front() {
+            self.back_seq.replace(v.seq);
+            self.congestion_window.on_loss();
             self.reset_write_timeout();
-            self.back_seq.replace(self.rcv_ack);
         }
     }
     pub fn decelerate(&self) -> bool {
         let distance = self.ack_distance();
-        let snd_wnd = (self.snd_wnd as usize) /*<< self.snd_window_shift_cnt*/;
-        snd_wnd < distance as usize
+        let snd_wnd = self.send_window() >> 2;
+        snd_wnd <= distance as usize
     }
     pub fn limit(&self) -> bool {
         let distance = self.ack_distance();
-        let snd_wnd = (self.snd_wnd as usize) /*<< self.snd_window_shift_cnt*/;
-        // window_shift_cnt doesn't seem to be effective,
-        // Using snd_wnd may cause the other party to not receive it.
-        // Perhaps it is because the 'slow start' of TCP congestion control has not been implemented
-        snd_wnd < distance as usize
+        let snd_wnd = self.send_window();
+        snd_wnd <= distance as usize
     }
     pub fn no_inflight_packet(&self) -> bool {
         self.inflight_packets.is_empty()
@@ -914,4 +977,37 @@ pub fn create_packet_raw(
     };
     bytes[16..18].copy_from_slice(&checksum.to_be_bytes());
     bytes
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct CongestionWindow {
+    cwnd: usize,
+    ssthresh: usize,
+    max_cwnd: usize,
+}
+impl CongestionWindow {
+    pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize) {
+        self.cwnd = initial_cwnd;
+        self.ssthresh = initial_cwnd;
+        self.max_cwnd = max_cwnd;
+    }
+
+    pub fn on_ack(&mut self) {
+        if self.cwnd < self.ssthresh {
+            self.cwnd *= 2;
+        } else {
+            self.cwnd += (self.cwnd as f64).sqrt() as usize;
+        }
+
+        self.cwnd = self.cwnd.min(self.max_cwnd);
+    }
+
+    pub fn on_loss(&mut self) {
+        self.ssthresh = self.cwnd / 2;
+        self.cwnd = 1;
+    }
+
+    pub fn current_window_size(&self) -> usize {
+        self.cwnd
+    }
 }
