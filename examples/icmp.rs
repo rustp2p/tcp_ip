@@ -1,4 +1,3 @@
-use bytes::BytesMut;
 use packet::{icmp, Builder, Packet as IcmpPacket};
 use std::sync::Arc;
 use tcp_ip::icmp::IcmpSocket;
@@ -7,6 +6,8 @@ use tun_rs::{AsyncDevice, Configuration};
 
 const MTU: u16 = 1420;
 
+/// After starting the program,ping 10.0.0.0/24 (e.g. ping 10.0.0.2),
+/// and you can receive a response from IcmpSocket
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -71,18 +72,10 @@ async fn tun_to_ip_stack(dev: Arc<AsyncDevice>, mut ip_stack_send: IpStackSend) 
 }
 
 async fn ip_stack_to_tun(mut ip_stack_recv: IpStackRecv, dev: Arc<AsyncDevice>) -> anyhow::Result<()> {
-    let mut bufs = Vec::with_capacity(128);
-    let mut sizes = vec![0; 128];
-    for _ in 0..128 {
-        bufs.push(BytesMut::zeroed(MTU as usize))
-    }
+    let mut buf = [0; MTU as usize];
     loop {
-        let num = ip_stack_recv.recv_ip_packet(&mut bufs, &mut sizes).await?;
-        log::debug!("ip_stack_to_tun num={num}");
-        for index in 0..num {
-            let buf = &bufs[index];
-            let len = sizes[index];
-            dev.send(&buf[..len]).await?;
-        }
+        let len = ip_stack_recv.recv(&mut buf).await?;
+        log::debug!("ip_stack_to_tun num={len}");
+        dev.send(&buf[..len]).await?;
     }
 }

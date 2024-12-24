@@ -10,7 +10,8 @@ use tun_rs::{AsyncDevice, Configuration};
 use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 
 const MTU: u16 = 1420;
-
+/// This example demonstrates how to use a TCP active connection to a userspace TCP/IP protocol stack,
+/// which can convert TCP data into IP packets.
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();

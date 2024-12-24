@@ -7,6 +7,9 @@ use tun_rs::{AsyncDevice, Configuration};
 
 const MTU: u16 = 1420;
 
+/// After starting, use a UDP send to any port in the 10.0.0.0/24 subnet
+/// Sending data will receive a response.
+/// Specifically, if sent to port 8080, a response will be received from udp_socket_8080
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -19,6 +22,7 @@ pub async fn main() -> anyhow::Result<()> {
     ip_stack_config.mtu = MTU;
     let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let udp_socket = UdpSocket::bind_all(ip_stack.clone()).await?;
+    // Bind to a specific address
     let udp_socket_8080 = UdpSocket::bind(ip_stack.clone(), "0.0.0.0:8080".parse().unwrap()).await?;
 
     let h1 = tokio::spawn(async {

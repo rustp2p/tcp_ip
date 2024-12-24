@@ -10,6 +10,8 @@ use tcp_ip::tcp::TcpListener;
 
 const MTU: u16 = 1420;
 
+/// After starting, use a TCP connection to any port in the 10.0.0.0/24 subnet (e.g., telnet 10.0.0.2 8080).
+/// Sending data will receive a response.
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

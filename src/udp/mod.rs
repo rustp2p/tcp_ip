@@ -73,10 +73,10 @@ impl UdpSocket {
 
         let checksum = match (src.ip(), dst.ip()) {
             (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
-                pnet_packet::util::ipv4_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+                pnet_packet::util::ipv4_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
             }
             (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
-                pnet_packet::util::ipv6_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+                pnet_packet::util::ipv6_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
             }
             (_, _) => {
                 unreachable!()

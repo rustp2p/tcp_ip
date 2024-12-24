@@ -15,6 +15,9 @@ pub struct Args {
     #[arg(short, long)]
     server_addr: SocketAddr,
 }
+
+/// Convert the IP packet into transport layer data and forward it to the target address.
+/// This functionality is typically required by VPN clients.
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
