@@ -32,8 +32,8 @@ pub struct IpStackConfig {
 
 impl IpStackConfig {
     pub fn check(&self) -> io::Result<()> {
-        if self.mtu < 68 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "mtu<68"));
+        if self.mtu < 576 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "mtu<576"));
         }
         if self.ip_fragment_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_fragment_timeout is zero"));
@@ -111,6 +111,13 @@ impl IpStackSend {
 }
 
 pub struct IpStackRecv {
+    inner: IpStackRecvInner,
+    index: usize,
+    num: usize,
+    sizes: Vec<usize>,
+    bufs: Vec<BytesMut>,
+}
+struct IpStackRecvInner {
     ip_stack: IpStack,
     identification: u16,
     packet_receiver: Receiver<TransportPacket>,
@@ -122,16 +129,23 @@ impl IpStackRecv {
             .duration_since(UNIX_EPOCH)
             .map(|v| (v.as_millis() & 0xFFFF) as u16)
             .unwrap_or(0);
-        Self {
+        let inner = IpStackRecvInner {
             ip_stack,
             identification,
             packet_receiver,
+        };
+        Self {
+            inner,
+            index: 0,
+            num: 0,
+            sizes: Vec::new(),
+            bufs: Vec::new(),
         }
     }
 }
 
 #[derive(Eq, Hash, PartialEq, Debug, Clone, Copy)]
-pub struct NetworkTuple {
+pub(crate) struct NetworkTuple {
     pub src: SocketAddr,
     pub dst: SocketAddr,
     pub protocol: IpNextHeaderProtocol,
@@ -144,7 +158,7 @@ impl NetworkTuple {
 }
 
 #[derive(Eq, Hash, PartialEq, Debug, Clone, Copy)]
-pub struct IdKey {
+struct IdKey {
     pub src: IpAddr,
     pub dst: IpAddr,
     pub protocol: IpNextHeaderProtocol,
@@ -152,7 +166,7 @@ pub struct IdKey {
 }
 
 impl IdKey {
-    pub fn new(src: IpAddr, dst: IpAddr, protocol: IpNextHeaderProtocol, identification: u16) -> Self {
+    fn new(src: IpAddr, dst: IpAddr, protocol: IpNextHeaderProtocol, identification: u16) -> Self {
         Self {
             src,
             dst,
@@ -160,7 +174,7 @@ impl IdKey {
             identification,
         }
     }
-    pub fn id_key(identification: u16, network_tuple: &NetworkTuple) -> Self {
+    fn id_key(identification: u16, network_tuple: &NetworkTuple) -> Self {
         Self::new(
             network_tuple.src.ip(),
             network_tuple.dst.ip(),
@@ -460,7 +474,40 @@ impl IpStackSend {
 }
 
 impl IpStackRecv {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.num > self.index {
+                let index = self.index;
+                let len = self.sizes[index];
+                if buf.len() < len {
+                    return Err(Error::new(io::ErrorKind::InvalidInput, "bufs too short"));
+                }
+                buf[..len].copy_from_slice(&self.bufs[index][..len]);
+                self.index += 1;
+                return Ok(len);
+            }
+            self.index = 0;
+            self.num = 0;
+            if self.sizes.is_empty() {
+                self.sizes.resize(128, 0);
+            }
+            if self.bufs.is_empty() {
+                for _ in 0..128 {
+                    self.bufs.push(BytesMut::zeroed(self.inner.ip_stack.config.mtu as usize));
+                }
+            }
+            self.num = self.inner.recv_ip_packet(&mut self.bufs, &mut self.sizes).await?;
+            if self.num == 0 {
+                return Err(Error::new(io::ErrorKind::UnexpectedEof, "read 0"));
+            }
+        }
+    }
     pub async fn recv_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize]) -> io::Result<usize> {
+        self.inner.recv_ip_packet(bufs, sizes).await
+    }
+}
+impl IpStackRecvInner {
+    async fn recv_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize]) -> io::Result<usize> {
         if let Some(packet) = self.packet_receiver.recv().await {
             self.split_ip_packet(bufs, sizes, packet)
         } else {
@@ -537,7 +584,7 @@ impl IpStackRecv {
 }
 
 #[derive(Debug)]
-pub struct TransportPacket {
+pub(crate) struct TransportPacket {
     pub buf: BytesMut,
     pub network_tuple: NetworkTuple,
 }
@@ -616,7 +663,7 @@ impl IpFragments {
     }
 }
 
-pub fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
+fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
     let src_ip = packet.get_source();
     let dest_ip = packet.get_destination();
     let (src_port, dest_port) = match packet.get_next_level_protocol() {
@@ -643,7 +690,7 @@ pub fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
     Ok(network_tuple)
 }
 
-pub fn convert_id_key(packet: &Ipv4Packet) -> IdKey {
+fn convert_id_key(packet: &Ipv4Packet) -> IdKey {
     let src_ip = packet.get_source();
     let dest_ip = packet.get_destination();
     let protocol = packet.get_next_level_protocol();
