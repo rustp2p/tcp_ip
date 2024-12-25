@@ -72,17 +72,21 @@ impl TcpStreamTask {
             if self.tcb.is_close() {
                 return Ok(());
             }
-            let data = self.recv_data().await;
-
             if !self.write_half_closed && !self.retransmission {
                 self.flush().await?;
             }
+            let data = self.recv_data().await;
+
             match data {
                 TaskRecvData::In(buf) => {
                     if let Some(reply_packet) = self.tcb.push_packet(buf) {
                         self.ip_stack.send_packet(reply_packet).await?;
                     }
                     self.push_application_layer().await;
+
+                    if self.tcb.is_close() {
+                        return Ok(());
+                    }
                 }
                 TaskRecvData::Out(buf) => {
                     self.write(buf).await?;

@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 const IP_HEADER_LEN: usize = 20;
 const TCP_HEADER_LEN: usize = 20;
-const IP_TCP_HEADER_LEN: usize = IP_HEADER_LEN + TCP_HEADER_LEN;
+pub const IP_TCP_HEADER_LEN: usize = IP_HEADER_LEN + TCP_HEADER_LEN;
 const MAX_DIFF: u32 = u32::MAX / 2;
 const MAX_PACKETS: usize = 256;
+const MSS_MIN: u16 = 536;
 
 /// Enum representing the various states of a TCP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::IntoPrimitive, num_enum::TryFromPrimitive)]
@@ -226,7 +227,7 @@ impl InflightPacket {
 #[derive(Debug, Clone, Copy)]
 pub struct TcpConfig {
     pub retransmission_timeout: Duration,
-    pub mss: u16,
+    pub mss: Option<u16>,
     pub window_shift_cnt: u8,
 }
 
@@ -234,7 +235,7 @@ impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
-            mss: 536,
+            mss: None,
             window_shift_cnt: 6,
         }
     }
@@ -242,9 +243,12 @@ impl Default for TcpConfig {
 
 impl TcpConfig {
     pub fn check(&self) -> io::Result<()> {
-        if self.mss < 536 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "mss cannot be less than 536"));
+        if let Some(mss) = self.mss {
+            if mss < MSS_MIN {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "mss cannot be less than 536"));
+            }
         }
+
         if self.retransmission_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "retransmission_timeout is zero"));
         }
@@ -266,7 +270,7 @@ impl Tcb {
             snd_wnd: 0,
             rcv_wnd: u16::MAX,
             rcv_ack: snd_seq,
-            mss: config.mss,
+            mss: config.mss.unwrap_or(MSS_MIN),
             sack_permitted: false,
             snd_window_shift_cnt: 0,
             rcv_window_shift_cnt: config.window_shift_cnt,
@@ -365,7 +369,8 @@ impl Tcb {
     fn init_congestion_window(&mut self) {
         let initial_cwnd = self.mss as usize * 4;
         let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
-        self.congestion_window.init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd);
+        self.congestion_window
+            .init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd, self.mss as usize);
     }
 }
 
@@ -497,7 +502,6 @@ impl Tcb {
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
                 if flags & ACK == ACK {
-                    self.snd_wnd = packet.get_window();
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
                     if acknowledgement == self.rcv_ack {
                         if self.rcv_ack != self.snd_seq {
@@ -506,9 +510,10 @@ impl Tcb {
                                 self.back_n();
                             }
                         }
+                        self.snd_wnd = packet.get_window();
                     }
 
-                    self.update_last_ack(acknowledgement);
+                    self.update_last_ack(&packet);
                     self.option_sack(&packet);
                 }
                 let seq = SeqNum(packet.get_sequence());
@@ -628,6 +633,7 @@ impl Tcb {
 
             let offset = (self.snd_ack - seq).0 as usize;
             if offset >= payload.len() {
+                self.rcv_wnd = self.rcv_wnd.saturating_add(payload.len() as u16);
                 self.unordered_packets.pop();
             } else {
                 let count = payload.len() - offset;
@@ -636,6 +642,7 @@ impl Tcb {
                 buf = &mut buf[min..];
                 self.snd_ack = self.snd_ack.add_num(min as u32);
                 if min == count {
+                    self.rcv_wnd = self.rcv_wnd.saturating_add(payload.len() as u16);
                     self.unordered_packets.pop();
                 }
             }
@@ -657,6 +664,7 @@ impl Tcb {
     }
 
     fn recv(&mut self, seq: SeqNum, flags: u8, payload: BytesMut) {
+        self.rcv_wnd = self.rcv_wnd.saturating_sub(payload.len() as u16);
         let unread_packet = UnreadPacket::new(seq, flags, payload);
         self.unordered_packets.push(unread_packet, handle_duplicate_seq);
     }
@@ -669,10 +677,10 @@ fn handle_duplicate_seq(p1: &UnreadPacket, p2: &UnreadPacket) -> bool {
 /// Implementation related to writing data
 impl Tcb {
     #[inline]
-    pub fn ack_distance(&self) -> u32 {
+    fn ack_distance(&self) -> u32 {
         (self.snd_seq - self.rcv_ack).0
     }
-    pub fn send_window(&self) -> usize {
+    fn send_window(&self) -> usize {
         let distance = self.ack_distance();
         let snd_wnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         let wnd = self.congestion_window.current_window_size().min(snd_wnd);
@@ -685,10 +693,12 @@ impl Tcb {
     pub fn set_ack(&mut self) {
         self.last_snd_ack = self.snd_ack;
     }
-    fn update_last_ack(&mut self, ack: SeqNum) {
+    fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
+        let ack = AckNum::from(tcp_packet.get_acknowledgement());
         if ack <= self.rcv_ack {
             return;
         }
+        self.snd_wnd = tcp_packet.get_window();
         self.congestion_window.on_ack();
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
@@ -749,6 +759,7 @@ impl Tcb {
 
         if let Some(mut packet) = self.take_send_buf() {
             let n = packet.write(&buf);
+            assert!(n > 0);
             self.inflight_packets.push_back(packet);
             let packet = self.create_transport_packet_seq(flags, seq, &buf[..n]);
             self.snd_seq.add_update(n as u32);
@@ -984,12 +995,14 @@ struct CongestionWindow {
     cwnd: usize,
     ssthresh: usize,
     max_cwnd: usize,
+    mss: usize,
 }
 impl CongestionWindow {
-    pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize) {
+    pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize, mss: usize) {
         self.cwnd = initial_cwnd;
         self.ssthresh = initial_cwnd;
         self.max_cwnd = max_cwnd;
+        self.mss = mss;
     }
 
     pub fn on_ack(&mut self) {
@@ -1004,7 +1017,7 @@ impl CongestionWindow {
 
     pub fn on_loss(&mut self) {
         self.ssthresh = self.cwnd / 2;
-        self.cwnd = 1;
+        self.cwnd = self.mss;
     }
 
     pub fn current_window_size(&self) -> usize {

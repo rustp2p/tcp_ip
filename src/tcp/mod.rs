@@ -134,6 +134,10 @@ impl TcpStream {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
+        let mut tcp_config = ip_stack.config.tcp_config;
+        if tcp_config.mss.is_none() {
+            tcp_config.mss.replace(ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
+        }
         let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
         let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         stream_task.connect().await?;
@@ -255,9 +259,12 @@ impl AsyncWrite for TcpStreamWriteHalf {
         }
         match self.payload_sender.poll_reserve(cx) {
             Poll::Ready(Ok(_)) => {
-                let len = buf.len().min(self.mss);
+                let len = buf.len().min(self.mss * 10);
                 let buf = &buf[..len];
-                _ = self.payload_sender.send_item(buf.into());
+                match self.payload_sender.send_item(buf.into()) {
+                    Ok(_) => {}
+                    Err(_) => return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero))),
+                };
                 Poll::Ready(Ok(buf.len()))
             }
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero))),
