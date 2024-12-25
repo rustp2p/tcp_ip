@@ -70,7 +70,7 @@ pub struct Tcb {
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
-    unordered_packets: TcpOfoQueue<UnreadPacket>,
+    unordered_packets: TcpOfoQueue,
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
     time_wait: Option<Instant>,
@@ -149,7 +149,7 @@ impl SeqNum {
 }
 
 #[derive(Debug)]
-struct UnreadPacket {
+pub(crate) struct UnreadPacket {
     seq: SeqNum,
     flags: u8,
     payload: BytesMut,
@@ -178,6 +178,9 @@ impl Ord for UnreadPacket {
 impl UnreadPacket {
     fn new(seq: SeqNum, flags: u8, payload: BytesMut) -> Self {
         Self { seq, flags, payload }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.payload.len()
     }
 }
 
@@ -228,6 +231,7 @@ impl InflightPacket {
 pub struct TcpConfig {
     pub retransmission_timeout: Duration,
     pub mss: Option<u16>,
+    pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
 }
 
@@ -236,6 +240,7 @@ impl Default for TcpConfig {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
             mss: None,
+            rcv_wnd: u16::MAX,
             window_shift_cnt: 6,
         }
     }
@@ -268,7 +273,7 @@ impl Tcb {
             snd_ack: AckNum::from(0),
             last_snd_ack: AckNum::from(0),
             snd_wnd: 0,
-            rcv_wnd: u16::MAX,
+            rcv_wnd: config.rcv_wnd,
             rcv_ack: snd_seq,
             mss: config.mss.unwrap_or(MSS_MIN),
             sack_permitted: false,
@@ -367,7 +372,7 @@ impl Tcb {
         None
     }
     fn init_congestion_window(&mut self) {
-        let initial_cwnd = self.mss as usize * 4;
+        let initial_cwnd = self.mss as usize * 10;
         let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         self.congestion_window
             .init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd, self.mss as usize);
@@ -472,7 +477,16 @@ impl Tcb {
         TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
     }
     fn create_packet(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], options: Option<&[u8]>) -> BytesMut {
-        create_packet_raw(&self.local_addr, &self.peer_addr, seq, ack, self.rcv_wnd, flags, payload, options)
+        create_packet_raw(
+            &self.local_addr,
+            &self.peer_addr,
+            seq,
+            ack,
+            self.recv_window(),
+            flags,
+            payload,
+            options,
+        )
     }
 }
 
@@ -574,8 +588,9 @@ impl Tcb {
 
             let payload = &packet.payload;
             let offset = (self.snd_ack - seq).0 as usize;
-            assert!(offset <= payload.len(), "{offset}<={}", payload.len());
-            len += payload.len() - offset;
+            if offset < payload.len() {
+                len += payload.len() - offset;
+            }
             let flags = packet.flags;
 
             if flags & FIN == FIN {
@@ -633,7 +648,6 @@ impl Tcb {
 
             let offset = (self.snd_ack - seq).0 as usize;
             if offset >= payload.len() {
-                self.rcv_wnd = self.rcv_wnd.saturating_add(payload.len() as u16);
                 self.unordered_packets.pop();
             } else {
                 let count = payload.len() - offset;
@@ -642,7 +656,6 @@ impl Tcb {
                 buf = &mut buf[min..];
                 self.snd_ack = self.snd_ack.add_num(min as u32);
                 if min == count {
-                    self.rcv_wnd = self.rcv_wnd.saturating_add(payload.len() as u16);
                     self.unordered_packets.pop();
                 }
             }
@@ -664,14 +677,15 @@ impl Tcb {
     }
 
     fn recv(&mut self, seq: SeqNum, flags: u8, payload: BytesMut) {
-        self.rcv_wnd = self.rcv_wnd.saturating_sub(payload.len() as u16);
         let unread_packet = UnreadPacket::new(seq, flags, payload);
-        self.unordered_packets.push(unread_packet, handle_duplicate_seq);
+        self.unordered_packets.push(unread_packet);
     }
-}
-
-fn handle_duplicate_seq(p1: &UnreadPacket, p2: &UnreadPacket) -> bool {
-    p1.payload.len() < p2.payload.len()
+    fn recv_window(&self) -> u16 {
+        let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
+        let unread_total_bytes = self.unordered_packets.total_bytes();
+        let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
+        (rcv_wnd >> self.rcv_window_shift_cnt) as u16
+    }
 }
 
 /// Implementation related to writing data
@@ -997,6 +1011,7 @@ struct CongestionWindow {
     max_cwnd: usize,
     mss: usize,
 }
+
 impl CongestionWindow {
     pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize, mss: usize) {
         self.cwnd = initial_cwnd;

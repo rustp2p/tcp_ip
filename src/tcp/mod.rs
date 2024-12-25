@@ -97,7 +97,7 @@ impl TcpListener {
                     let data = tcb::create_transport_packet_raw(
                         &local_addr,
                         &peer_addr,
-                        0,
+                        tcp_packet.get_acknowledgement(),
                         tcp_packet.get_sequence().wrapping_add(1),
                         0,
                         RST | ACK,

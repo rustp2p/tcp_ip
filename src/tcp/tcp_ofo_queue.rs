@@ -1,10 +1,59 @@
+use crate::tcp::tcb::UnreadPacket;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
 
+#[derive(Debug, Default)]
+pub(crate) struct TcpOfoQueue {
+    total_bytes: usize,
+    queue: OrderQueue<UnreadPacket>,
+}
+fn handle_duplicate_seq(p1: &UnreadPacket, p2: &UnreadPacket) -> bool {
+    p1.len() < p2.len()
+}
+impl TcpOfoQueue {
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+    pub fn push(&mut self, elt: UnreadPacket) {
+        self.total_bytes += elt.len();
+        self.queue.push(elt, handle_duplicate_seq);
+    }
+    pub fn pop(&mut self) -> Option<UnreadPacket> {
+        if let Some(v) = self.queue.pop() {
+            self.total_bytes -= v.len();
+            Some(v)
+        } else {
+            None
+        }
+    }
+    pub fn peek(&self) -> Option<&UnreadPacket> {
+        self.queue.peek()
+    }
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.total_bytes = 0;
+    }
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a TcpOfoQueue {
+    type Item = &'a UnreadPacket;
+    type IntoIter = Iter<'a, UnreadPacket>;
+
+    fn into_iter(self) -> Iter<'a, UnreadPacket> {
+        self.queue.iter()
+    }
+}
+
 #[derive(Debug)]
-pub struct TcpOfoQueue<T> {
+pub struct OrderQueue<T> {
     head: Option<NonNull<Node<T>>>,
     tail: Option<NonNull<Node<T>>>,
     len: usize,
@@ -25,12 +74,12 @@ impl<T> Node<T> {
         }
     }
 }
-impl<T> Default for TcpOfoQueue<T> {
+impl<T> Default for OrderQueue<T> {
     fn default() -> Self {
-        TcpOfoQueue::new()
+        OrderQueue::new()
     }
 }
-impl<T: Ord> TcpOfoQueue<T> {
+impl<T: Ord> OrderQueue<T> {
     pub fn push<F>(&mut self, elt: T, compute: F)
     where
         F: Fn(&T, &T) -> bool,
@@ -82,18 +131,19 @@ impl<T: Ord> TcpOfoQueue<T> {
 
         self.len += 1;
     }
-    pub fn peek(&self) -> Option<&T> {
-        self.head.map(|v| unsafe { &(*v.as_ptr()).element })
-    }
 }
 
-impl<T> TcpOfoQueue<T> {
+impl<T> OrderQueue<T> {
     pub fn new() -> Self {
         Self {
             head: None,
             tail: None,
             len: 0,
         }
+    }
+    #[inline]
+    pub fn peek(&self) -> Option<&T> {
+        self.head.map(|v| unsafe { &(*v.as_ptr()).element })
     }
     pub fn pop(&mut self) -> Option<T> {
         self.head.map(|node| {
@@ -112,7 +162,7 @@ impl<T> TcpOfoQueue<T> {
         })
     }
     pub fn clear(&mut self) {
-        drop(TcpOfoQueue {
+        drop(OrderQueue {
             head: self.head.take(),
             tail: self.tail.take(),
             len: mem::take(&mut self.len),
@@ -142,7 +192,7 @@ pub struct Iter<'a, T: 'a> {
 }
 
 pub struct IntoIter<T> {
-    list: TcpOfoQueue<T>,
+    list: OrderQueue<T>,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -183,7 +233,7 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a TcpOfoQueue<T> {
+impl<'a, T> IntoIterator for &'a OrderQueue<T> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
 
@@ -192,7 +242,7 @@ impl<'a, T> IntoIterator for &'a TcpOfoQueue<T> {
     }
 }
 
-impl<T> IntoIterator for TcpOfoQueue<T> {
+impl<T> IntoIterator for OrderQueue<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
@@ -203,14 +253,14 @@ impl<T> IntoIterator for TcpOfoQueue<T> {
     }
 }
 
-impl<T> Drop for TcpOfoQueue<T> {
+impl<T> Drop for OrderQueue<T> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
     }
 }
-unsafe impl<T: Send> Send for TcpOfoQueue<T> {}
+unsafe impl<T: Send> Send for OrderQueue<T> {}
 
-unsafe impl<T: Sync> Sync for TcpOfoQueue<T> {}
+unsafe impl<T: Sync> Sync for OrderQueue<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -220,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_push_and_peek() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
         queue.push(10, |_, _| false);
         assert_eq!(queue.peek(), Some(&10));
         queue.push(20, |_, _| false);
@@ -240,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_push_with_duplicate_handling() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         queue.push(10, |_, _| false);
         queue.push(10, |_, _| false);
@@ -255,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_pop() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         queue.push(10, |_, _| false);
         queue.push(20, |_, _| false);
@@ -281,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         queue.push(10, |_, _| false);
         queue.push(20, |_, _| false);
@@ -295,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_len() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         assert_eq!(queue.len, 0);
 
@@ -314,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_ordering() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         queue.push(15, |_, _| false);
         queue.push(10, |_, _| false);
@@ -329,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_drop_after_pop() {
-        let mut queue = TcpOfoQueue::new();
+        let mut queue = OrderQueue::new();
 
         // Create elements that track drop count
         let mut elem1 = Arc::new(10);
