@@ -241,7 +241,7 @@ impl Default for TcpConfig {
             retransmission_timeout: Duration::from_millis(1000),
             mss: None,
             rcv_wnd: u16::MAX,
-            window_shift_cnt: 6,
+            window_shift_cnt: 4,
         }
     }
 }
@@ -372,7 +372,7 @@ impl Tcb {
         None
     }
     fn init_congestion_window(&mut self) {
-        let initial_cwnd = self.mss as usize * 10;
+        let initial_cwnd = self.mss as usize * 4;
         let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
         self.congestion_window
             .init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd, self.mss as usize);
@@ -1015,7 +1015,7 @@ struct CongestionWindow {
 impl CongestionWindow {
     pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize, mss: usize) {
         self.cwnd = initial_cwnd;
-        self.ssthresh = initial_cwnd;
+        self.ssthresh = initial_ssthresh;
         self.max_cwnd = max_cwnd;
         self.mss = mss;
     }
