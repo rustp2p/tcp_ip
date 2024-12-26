@@ -1,12 +1,15 @@
 use std::io;
 use std::io::Error;
-use std::pin::Pin;
+use std::ops::Add;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
-use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
@@ -19,12 +22,28 @@ pub struct TcpStreamTask {
     application_layer_receiver: Receiver<BytesMut>,
     last_buffer: Option<BytesMut>,
     packet_receiver: Receiver<TransportPacket>,
-    application_layer_sender: Sender<BytesMut>,
-    timeout: Duration,
-    read_half_closed: bool,
+    application_layer_sender: Option<Sender<BytesMut>>,
     write_half_closed: bool,
     retransmission: bool,
-    count: usize,
+    read_notify: ReadNotify,
+}
+#[derive(Clone, Default, Debug)]
+pub struct ReadNotify {
+    readable: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+impl ReadNotify {
+    pub fn notify(&self) {
+        if self.readable.load(Ordering::Acquire) {
+            self.notify.notify_one();
+        }
+    }
+    async fn notified(&self) {
+        self.notify.notified().await
+    }
+    fn set_state(&self, readable: bool) {
+        self.readable.store(readable, Ordering::Release);
+    }
 }
 
 impl Drop for TcpStreamTask {
@@ -44,27 +63,27 @@ impl TcpStreamTask {
         application_layer_receiver: Receiver<BytesMut>,
         packet_receiver: Receiver<TransportPacket>,
     ) -> Self {
-        let timeout = ip_stack.config.tcp_config.retransmission_timeout;
         Self {
             tcb,
             ip_stack,
             application_layer_receiver,
             last_buffer: None,
             packet_receiver,
-            application_layer_sender,
-            timeout,
-            read_half_closed: false,
+            application_layer_sender: Some(application_layer_sender),
             write_half_closed: false,
             retransmission: false,
-            count: 0,
+            read_notify: Default::default(),
         }
+    }
+    pub fn read_notify(&self) -> ReadNotify {
+        self.read_notify.clone()
     }
 }
 
 impl TcpStreamTask {
     pub async fn run(&mut self) -> io::Result<()> {
         let result = self.run0().await;
-        self.push_application_layer().await;
+        self.push_application_layer();
         result
     }
     pub async fn run0(&mut self) -> io::Result<()> {
@@ -82,7 +101,7 @@ impl TcpStreamTask {
                     if let Some(reply_packet) = self.tcb.push_packet(buf) {
                         self.ip_stack.send_packet(reply_packet).await?;
                     }
-                    self.push_application_layer().await;
+                    self.push_application_layer();
 
                     if self.tcb.is_close() {
                         return Ok(());
@@ -109,6 +128,9 @@ impl TcpStreamTask {
                         self.ip_stack.send_packet(packet).await?;
                     }
                 }
+                TaskRecvData::ReadNotify => {
+                    self.push_application_layer();
+                }
             }
             if self.try_retransmission().await? {
                 self.retransmission = true;
@@ -116,11 +138,14 @@ impl TcpStreamTask {
                 self.retransmission = false;
                 self.try_send_ack().await?;
             }
-            self.tcb.set_ack();
-            if !self.read_half_closed && self.tcb.cannot_read() {
-                self.close_read().await;
+            self.tcb.perform_post_ack_action();
+            if !self.read_half_closed() && self.tcb.cannot_read() {
+                self.close_read();
             }
         }
+    }
+    fn read_half_closed(&self) -> bool {
+        self.application_layer_sender.is_none()
     }
     pub fn mss(&self) -> u16 {
         self.tcb.mss()
@@ -128,38 +153,45 @@ impl TcpStreamTask {
     fn only_recv_in(&self) -> bool {
         self.retransmission || self.last_buffer.is_some() || self.write_half_closed || self.tcb.limit()
     }
-    async fn push_application_layer(&mut self) {
-        if self.read_half_closed {
-            self.tcb.read_none();
-        } else {
-            let len = self.tcb.readable();
+    fn push_application_layer(&mut self) {
+        if let Some(sender) = self.application_layer_sender.as_ref() {
+            let len = self.tcb.readable_bytes();
+            let mut read_half_closed = false;
             if len > 0 {
-                let mut buffer = BytesMut::zeroed(len);
-                let len = self.tcb.read(&mut buffer);
-                buffer.truncate(len);
-                if !buffer.is_empty() {
-                    match self.application_layer_sender.send(buffer).await {
-                        Ok(_) => {}
-                        Err(_e) => {
-                            // Ignore the closure of reading
-                            self.read_half_closed = true;
+                match sender.try_reserve() {
+                    Ok(sender) => {
+                        let mut buffer = BytesMut::zeroed(len.min(1024 * 1024));
+                        let len = self.tcb.read(&mut buffer);
+                        buffer.truncate(len);
+                        if !buffer.is_empty() {
+                            sender.send(buffer);
                         }
                     }
+                    Err(e) => match e {
+                        TrySendError::Full(_) => {}
+                        TrySendError::Closed(_) => {
+                            read_half_closed = true;
+                        }
+                    },
                 }
+                self.read_notify.set_state(self.tcb.readable());
             }
-            if self.tcb.cannot_read() {
-                self.close_read().await;
+            if self.tcb.cannot_read() || read_half_closed {
+                self.close_read();
             }
+        } else {
+            self.tcb.read_none();
         }
     }
-    async fn close_read(&mut self) {
-        _ = self.application_layer_sender.send(BytesMut::new()).await;
-        self.read_half_closed = true;
+    fn close_read(&mut self) {
+        if let Some(sender) = self.application_layer_sender.take() {
+            _ = sender.try_send(BytesMut::new());
+        }
     }
     async fn write_slice0(tcb: &mut Tcb, ip_stack: &IpStack, mut buf: &[u8]) -> io::Result<usize> {
         let len = buf.len();
         while !buf.is_empty() {
-            if let Some((packet, len)) = tcb.write(&buf) {
+            if let Some((packet, len)) = tcb.write(buf) {
                 if len == 0 {
                     break;
                 }
@@ -222,19 +254,6 @@ impl TcpStreamTask {
         Ok(())
     }
 
-    async fn recv_timeout_at(&mut self, deadline: Instant) -> TaskRecvData {
-        tokio::select! {
-            rs=self.packet_receiver.recv()=>{
-                rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
-            }
-            rs=self.application_layer_receiver.recv()=>{
-                rs.map(|v| TaskRecvData::Out(v)).unwrap_or(TaskRecvData::OutClose)
-            }
-            _=tokio::time::sleep_until(deadline)=>{
-                TaskRecvData::Timeout
-            }
-        }
-    }
     async fn recv_data(&mut self) -> TaskRecvData {
         let deadline = if let Some(v) = self.tcb.time_wait() {
             Some(v.into())
@@ -243,23 +262,15 @@ impl TcpStreamTask {
         };
 
         if let Some(deadline) = deadline {
-            if deadline < Instant::now() {
-                TaskRecvData::Timeout
-            } else if self.only_recv_in() {
+            if self.only_recv_in() {
                 self.recv_in_timeout_at(deadline).await
-            } else if let Some(data) = self.try_recv() {
-                data
             } else {
                 self.recv_timeout_at(deadline).await
             }
+        } else if self.only_recv_in() {
+            self.recv_in().await
         } else {
-            if self.only_recv_in() {
-                self.recv_in().await
-            } else if let Some(data) = self.try_recv() {
-                data
-            } else {
-                self.recv().await
-            }
+            self.recv().await
         }
     }
     async fn recv(&mut self) -> TaskRecvData {
@@ -268,61 +279,55 @@ impl TcpStreamTask {
                 rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
             }
             rs=self.application_layer_receiver.recv()=>{
-                rs.map(|v| TaskRecvData::Out(v)).unwrap_or(TaskRecvData::OutClose)
+                rs.map(TaskRecvData::Out).unwrap_or(TaskRecvData::OutClose)
+            }
+            _=self.read_notify.notified()=>{
+                TaskRecvData::ReadNotify
             }
         }
     }
-    fn try_recv(&mut self) -> Option<TaskRecvData> {
-        self.count += 1;
-        if self.count & 1 == 1 {
-            let option = self.try_recv_in();
-            if option.is_some() {
-                return option;
+    async fn recv_timeout_at(&mut self, deadline: Instant) -> TaskRecvData {
+        tokio::select! {
+            rs=self.packet_receiver.recv()=>{
+                rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
             }
-            self.try_recv_out()
-        } else {
-            let option = self.try_recv_out();
-            if option.is_some() {
-                return option;
+            rs=self.application_layer_receiver.recv()=>{
+                rs.map(TaskRecvData::Out).unwrap_or(TaskRecvData::OutClose)
             }
-            self.try_recv_in()
+            _=tokio::time::sleep_until(deadline)=>{
+                TaskRecvData::Timeout
+            }
+            _=self.read_notify.notified()=>{
+                TaskRecvData::ReadNotify
+            }
         }
     }
-    fn try_recv_in(&mut self) -> Option<TaskRecvData> {
-        match self.packet_receiver.try_recv() {
-            Ok(rs) => Some(TaskRecvData::In(rs.buf)),
-            Err(e) => match e {
-                TryRecvError::Empty => None,
-                TryRecvError::Disconnected => Some(TaskRecvData::InClose),
-            },
-        }
-    }
-    fn try_recv_out(&mut self) -> Option<TaskRecvData> {
-        match self.application_layer_receiver.try_recv() {
-            Ok(rs) => Some(TaskRecvData::Out(rs)),
-            Err(e) => match e {
-                TryRecvError::Empty => None,
-                TryRecvError::Disconnected => Some(TaskRecvData::OutClose),
-            },
-        }
-    }
+
     async fn recv_in_timeout_at(&mut self, deadline: Instant) -> TaskRecvData {
-        tokio::time::timeout_at(deadline, self.recv_in())
-            .await
-            .unwrap_or_else(|_| TaskRecvData::Timeout)
+        tokio::select! {
+            rs=self.packet_receiver.recv()=>{
+                rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
+            }
+            _=tokio::time::sleep_until(deadline)=>{
+                TaskRecvData::Timeout
+            }
+            _=self.read_notify.notified()=>{
+                TaskRecvData::ReadNotify
+            }
+        }
     }
     async fn recv_in_timeout(&mut self, duration: Duration) -> TaskRecvData {
-        tokio::time::timeout(duration, self.recv_in())
-            .await
-            .unwrap_or_else(|_| TaskRecvData::Timeout)
+        self.recv_in_timeout_at(Instant::now().add(duration)).await
     }
     async fn recv_in(&mut self) -> TaskRecvData {
-        let rs = self.packet_receiver.recv().await;
-        rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
-    }
-    async fn recv_out(&mut self) -> TaskRecvData {
-        let rs = self.application_layer_receiver.recv().await;
-        rs.map(|v| TaskRecvData::Out(v)).unwrap_or(TaskRecvData::OutClose)
+        tokio::select! {
+            rs=self.packet_receiver.recv()=>{
+                rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
+            }
+            _=self.read_notify.notified()=>{
+                TaskRecvData::ReadNotify
+            }
+        }
     }
 }
 
@@ -358,6 +363,7 @@ impl TcpStreamTask {
 enum TaskRecvData {
     In(BytesMut),
     Out(BytesMut),
+    ReadNotify,
     InClose,
     OutClose,
     Timeout,

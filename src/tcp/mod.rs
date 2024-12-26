@@ -1,7 +1,5 @@
-#![allow(unused, unused_variables)]
-
 use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket, UNSPECIFIED_ADDR};
-use crate::tcp::sys::TcpStreamTask;
+use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 use bytes::{Buf, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
@@ -10,15 +8,10 @@ use std::collections::HashMap;
 use std::io;
 use std::io::Error;
 use std::net::SocketAddr;
-use std::ops::Add;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::Notify;
+use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
 pub use tcb::TcpConfig;
@@ -40,6 +33,7 @@ pub struct TcpStream {
     write: TcpStreamWriteHalf,
 }
 pub struct TcpStreamReadHalf {
+    read_notify: ReadNotify,
     last_buf: Option<BytesMut>,
     payload_receiver: Receiver<BytesMut>,
 }
@@ -141,6 +135,7 @@ impl TcpStream {
         let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
         let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         stream_task.connect().await?;
+        let read_notify = stream_task.read_notify();
         let mss = stream_task.mss() as usize;
         tokio::spawn(async move {
             if let Err(e) = stream_task.run().await {
@@ -148,6 +143,7 @@ impl TcpStream {
             }
         });
         let read = TcpStreamReadHalf {
+            read_notify,
             last_buf: None,
             payload_receiver,
         };
@@ -172,9 +168,10 @@ impl TcpStream {
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
         let mss = tcb.mss() as usize;
-        let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
-
+        let stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
+        let read_notify = stream_task.read_notify();
         let read = TcpStreamReadHalf {
+            read_notify,
             last_buf: None,
             payload_receiver,
         };
@@ -233,6 +230,7 @@ impl AsyncRead for TcpStreamReadHalf {
                 if !p.is_empty() {
                     self.last_buf.replace(p);
                 }
+                self.read_notify.notify();
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => Poll::Pending,
@@ -272,11 +270,11 @@ impl AsyncWrite for TcpStreamWriteHalf {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         self.payload_sender.close();
         Poll::Ready(Ok(()))
     }
