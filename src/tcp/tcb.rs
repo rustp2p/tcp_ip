@@ -238,7 +238,8 @@ impl Default for TcpConfig {
             retransmission_timeout: Duration::from_millis(1000),
             mss: None,
             rcv_wnd: u16::MAX,
-            window_shift_cnt: 4,
+            // Window size too large can cause packet loss
+            window_shift_cnt: 2,
         }
     }
 }
@@ -422,9 +423,7 @@ impl Tcb {
                     // Selective acknowledgements permitted.
                     self.sack_permitted = true;
                 }
-                TcpOptionNumber(_) => {
-                    // todo Handle other options
-                }
+                TcpOptionNumber(_) => {}
             }
         }
     }
@@ -554,12 +553,7 @@ impl Tcb {
             }
             _ => {
                 // RST
-            } // TcpState::Listen => {}
-              // TcpState::SynSent => {}
-              // TcpState::SynReceived => {}
-              // TcpState::Closing => {}
-              // TcpState::LastAck => {}
-              // TcpState::Closed => {}
+            }
         }
         self.error();
         let reply_packet = self.create_transport_packet(RST, &[]);
@@ -839,14 +833,12 @@ impl Tcb {
         }
     }
     pub fn decelerate(&self) -> bool {
-        let distance = self.ack_distance();
-        let snd_wnd = self.send_window() >> 2;
-        snd_wnd <= distance as usize
+        let snd_wnd = self.send_window();
+        snd_wnd <= (self.mss as usize) << 4
     }
     pub fn limit(&self) -> bool {
-        let distance = self.ack_distance();
         let snd_wnd = self.send_window();
-        snd_wnd <= distance as usize
+        snd_wnd == 0
     }
     pub fn no_inflight_packet(&self) -> bool {
         self.inflight_packets.is_empty()
