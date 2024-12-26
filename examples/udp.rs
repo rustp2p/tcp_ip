@@ -1,3 +1,4 @@
+#![allow(unused, unused_variables)]
 use bytes::BytesMut;
 use pnet_packet::Packet;
 use std::sync::Arc;
@@ -18,8 +19,10 @@ pub async fn main() -> anyhow::Result<()> {
     config.mtu(MTU).address_with_prefix((10, 0, 0, 29), 24).up();
     let dev = tun_rs::create_as_async(&config)?;
     let dev = Arc::new(dev);
-    let mut ip_stack_config = IpStackConfig::default();
-    ip_stack_config.mtu = MTU;
+    let ip_stack_config = IpStackConfig {
+        mtu: MTU,
+        ..Default::default()
+    };
     let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let udp_socket = UdpSocket::bind_all(ip_stack.clone()).await?;
     // Bind to a specific address

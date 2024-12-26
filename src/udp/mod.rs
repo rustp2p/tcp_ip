@@ -93,6 +93,6 @@ impl UdpSocket {
 }
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        _ = self.ip_stack.remove_socket(IpNextHeaderProtocols::Udp, &self.local_addr);
+        self.ip_stack.remove_socket(IpNextHeaderProtocols::Udp, &self.local_addr);
     }
 }

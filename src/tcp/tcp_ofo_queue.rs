@@ -1,3 +1,4 @@
+#![allow(unused, unused_variables)]
 use crate::tcp::tcb::UnreadPacket;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -284,7 +285,7 @@ mod tests {
         queue.push(1, |_, _| false);
         assert_eq!(queue.peek(), Some(&1));
         assert_eq!(queue.len(), 6);
-        let list: Vec<i32> = queue.iter().map(|v| *v).collect();
+        let list: Vec<i32> = queue.iter().copied().collect();
         assert_eq!(&list, &[1, 5, 6, 7, 10, 20]);
     }
 
