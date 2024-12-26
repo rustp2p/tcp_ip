@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bytes::BytesMut;
 use dashmap::{DashMap, Entry};
 use parking_lot::Mutex;
@@ -174,14 +172,6 @@ impl IdKey {
             identification,
         }
     }
-    fn id_key(identification: u16, network_tuple: &NetworkTuple) -> Self {
-        Self::new(
-            network_tuple.src.ip(),
-            network_tuple.dst.ip(),
-            network_tuple.protocol,
-            identification,
-        )
-    }
 }
 
 pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStackRecv)> {
@@ -329,50 +319,50 @@ impl IpStackSend {
     fn get_tcp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(tcp) = stack.tcp_stream_map.get(&network_tuple) {
-            Some(SenderBox::MPSC(tcp.value().clone()))
+            Some(SenderBox::Mpsc(tcp.value().clone()))
         } else if let Some(tcp) = stack.tcp_listener_map.get(&network_tuple.dst) {
-            Some(SenderBox::MPSC(tcp.value().clone()))
+            Some(SenderBox::Mpsc(tcp.value().clone()))
         } else {
             let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
             if let Some(tcp) = stack.tcp_listener_map.get(&dst) {
-                Some(SenderBox::MPSC(tcp.value().clone()))
-            } else if let Some(tcp) = stack.tcp_listener_map.get(&UNSPECIFIED_ADDR) {
-                Some(SenderBox::MPSC(tcp.value().clone()))
+                Some(SenderBox::Mpsc(tcp.value().clone()))
             } else {
-                // not tcp listener
-                None
+                stack
+                    .tcp_listener_map
+                    .get(&UNSPECIFIED_ADDR)
+                    .map(|tcp| SenderBox::Mpsc(tcp.value().clone()))
             }
         }
     }
     fn get_udp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(udp) = stack.udp_socket_map.get(&network_tuple.dst) {
-            Some(SenderBox::MPMC(udp.value().clone()))
+            Some(SenderBox::Mpmc(udp.value().clone()))
         } else {
             let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
             if let Some(udp) = stack.udp_socket_map.get(&dst) {
-                Some(SenderBox::MPMC(udp.value().clone()))
-            } else if let Some(udp) = stack.udp_socket_map.get(&UNSPECIFIED_ADDR) {
-                Some(SenderBox::MPMC(udp.value().clone()))
+                Some(SenderBox::Mpmc(udp.value().clone()))
             } else {
-                // not udp listener
-                None
+                stack
+                    .udp_socket_map
+                    .get(&UNSPECIFIED_ADDR)
+                    .map(|udp| SenderBox::Mpmc(udp.value().clone()))
             }
         }
     }
     fn get_icmp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(icmp) = stack.icmp_socket_map.get(&network_tuple.dst) {
-            Some(SenderBox::MPMC(icmp.value().clone()))
+            Some(SenderBox::Mpmc(icmp.value().clone()))
         } else {
             let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
             if let Some(icmp) = stack.icmp_socket_map.get(&dst) {
-                Some(SenderBox::MPMC(icmp.value().clone()))
-            } else if let Some(icmp) = stack.icmp_socket_map.get(&UNSPECIFIED_ADDR) {
-                Some(SenderBox::MPMC(icmp.value().clone()))
+                Some(SenderBox::Mpmc(icmp.value().clone()))
             } else {
-                // not icmp listener
-                None
+                stack
+                    .icmp_socket_map
+                    .get(&UNSPECIFIED_ADDR)
+                    .map(|icmp| SenderBox::Mpmc(icmp.value().clone()))
             }
         }
     }
@@ -384,7 +374,7 @@ impl IpStackSend {
         network_tuple: NetworkTuple,
     ) -> io::Result<()> {
         let more_fragments = packet.get_flags() & Ipv4Flags::MoreFragments == Ipv4Flags::MoreFragments;
-        let offset = packet.get_fragment_offset() as u16;
+        let offset = packet.get_fragment_offset();
         let segmented = more_fragments || offset > 0;
         let buf = if segmented {
             // merge ip fragments
@@ -403,13 +393,13 @@ impl IpStackSend {
         Ok(())
     }
     fn prepare_ip_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
-        let offset = ip_packet.get_fragment_offset() as u16;
+        let offset = ip_packet.get_fragment_offset();
         let network_tuple = if offset == 0 {
             // No segmentation or the first segmentation
-            convert_network_tuple(&ip_packet)?
+            convert_network_tuple(ip_packet)?
         } else {
             let mut guard = self.ident_fragments_map.lock();
-            let p = guard.entry(id_key).or_insert_with(|| IpFragments::default());
+            let p = guard.entry(id_key).or_default();
 
             if let Some(v) = p.network_tuple {
                 v
@@ -699,15 +689,15 @@ fn convert_id_key(packet: &Ipv4Packet) -> IdKey {
 }
 
 enum SenderBox<T> {
-    MPSC(Sender<T>),
-    MPMC(flume::Sender<T>),
+    Mpsc(Sender<T>),
+    Mpmc(flume::Sender<T>),
 }
 
 impl<T> SenderBox<T> {
     async fn send(&self, t: T) -> bool {
         match self {
-            SenderBox::MPSC(sender) => sender.send(t).await.is_ok(),
-            SenderBox::MPMC(sender) => sender.send_async(t).await.is_ok(),
+            SenderBox::Mpsc(sender) => sender.send(t).await.is_ok(),
+            SenderBox::Mpmc(sender) => sender.send_async(t).await.is_ok(),
         }
     }
 }

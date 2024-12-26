@@ -1,3 +1,4 @@
+#![allow(unused, unused_variables)]
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +21,10 @@ pub async fn main() -> anyhow::Result<()> {
     config.mtu(MTU).address_with_prefix(local_ip, 24).up();
     let dev = tun_rs::create_as_async(&config)?;
     let dev = Arc::new(dev);
-    let mut ip_stack_config = IpStackConfig::default();
-    ip_stack_config.mtu = MTU;
+    let ip_stack_config = IpStackConfig {
+        mtu: MTU,
+        ..Default::default()
+    };
     let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let dev1 = dev.clone();
     tokio::spawn(async {

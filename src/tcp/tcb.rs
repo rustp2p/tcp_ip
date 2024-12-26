@@ -1,18 +1,20 @@
-use crate::buffer::FixedBuffer;
-use crate::ip_stack::{NetworkTuple, TransportPacket};
-use crate::tcp::tcp_ofo_queue::TcpOfoQueue;
+use std::cmp::Ordering;
+use std::collections::VecDeque;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::{Add, Sub};
+use std::time::{Duration, Instant};
+
 use bytes::{Buf, BufMut, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::TcpFlags::{ACK, FIN, PSH, RST, SYN};
 use pnet_packet::tcp::{TcpOptionNumber, TcpOptionNumbers, TcpPacket};
 use pnet_packet::Packet;
 use rand::RngCore;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, LinkedList, VecDeque};
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::ops::{Add, Sub};
-use std::time::{Duration, Instant};
+
+use crate::buffer::FixedBuffer;
+use crate::ip_stack::{NetworkTuple, TransportPacket};
+use crate::tcp::tcp_ofo_queue::TcpOfoQueue;
 
 const IP_HEADER_LEN: usize = 20;
 const TCP_HEADER_LEN: usize = 20;
@@ -78,6 +80,7 @@ pub struct Tcb {
     retransmission_timeout: Duration,
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
+    relay_ack: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -92,9 +95,9 @@ impl From<u32> for SeqNum {
     }
 }
 
-impl Into<u32> for SeqNum {
-    fn into(self) -> u32 {
-        self.0
+impl From<SeqNum> for u32 {
+    fn from(value: SeqNum) -> Self {
+        value.0
     }
 }
 
@@ -137,14 +140,8 @@ impl SeqNum {
     fn add_num(self, n: u32) -> Self {
         SeqNum(self.0.wrapping_add(n))
     }
-    fn sub_num(self, n: u32) -> Self {
-        SeqNum(self.0.wrapping_sub(n))
-    }
     fn add_update(&mut self, n: u32) {
         self.0 = self.0.wrapping_add(n)
-    }
-    fn sub_update(&mut self, n: u32) {
-        self.0 = self.0.wrapping_sub(n)
     }
 }
 
@@ -165,7 +162,7 @@ impl PartialEq<Self> for UnreadPacket {
 
 impl PartialOrd<Self> for UnreadPacket {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.seq.partial_cmp(&other.seq)
+        Some(self.cmp(other))
     }
 }
 
@@ -289,6 +286,7 @@ impl Tcb {
             retransmission_timeout: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
+            relay_ack: false,
         }
     }
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
@@ -333,41 +331,41 @@ impl Tcb {
         }
         let header_len = packet.get_data_offset() as usize * 4;
         let flags = packet.get_flags();
-        if self.state == TcpState::SynReceived {
-            if flags & ACK == ACK && self.snd_ack.0 == packet.get_sequence() && self.snd_seq.add_num(1).0 == packet.get_acknowledgement() {
-                self.snd_wnd = packet.get_window();
-                self.snd_seq = SeqNum(packet.get_acknowledgement());
-                self.rcv_ack = SeqNum(packet.get_acknowledgement());
-                self.recv_syn_ack();
-                self.init_congestion_window();
-                if !packet.payload().is_empty() {
-                    let seq = SeqNum(packet.get_sequence());
-                    buf.advance(header_len);
-                    self.recv(seq, flags, buf)
-                }
-                return true;
+        if self.state == TcpState::SynReceived
+            && flags & ACK == ACK
+            && self.snd_ack.0 == packet.get_sequence()
+            && self.snd_seq.add_num(1).0 == packet.get_acknowledgement()
+        {
+            self.snd_wnd = packet.get_window();
+            self.snd_seq = SeqNum(packet.get_acknowledgement());
+            self.rcv_ack = SeqNum(packet.get_acknowledgement());
+            self.recv_syn_ack();
+            self.init_congestion_window();
+            if !packet.payload().is_empty() {
+                let seq = SeqNum(packet.get_sequence());
+                buf.advance(header_len);
+                self.recv(seq, flags, buf)
             }
+            return true;
         }
         false
     }
-    pub fn try_syn_sent_to_established(&mut self, mut buf: BytesMut) -> Option<TransportPacket> {
+    pub fn try_syn_sent_to_established(&mut self, buf: BytesMut) -> Option<TransportPacket> {
         let Some(packet) = TcpPacket::new(&buf) else {
             self.error();
             return None;
         };
         let flags = packet.get_flags();
-        if self.state == TcpState::SynSent {
-            if flags & ACK == ACK && flags & SYN == SYN {
-                self.snd_seq.add_update(1);
-                self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
-                self.last_snd_ack = self.snd_ack;
-                self.rcv_ack = SeqNum(packet.get_acknowledgement());
-                self.snd_wnd = packet.get_window();
-                self.recv_syn_ack();
-                self.init_congestion_window();
-                let relay = self.create_option_transport_packet(ACK, &[], None);
-                return Some(relay);
-            }
+        if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
+            self.snd_seq.add_update(1);
+            self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
+            self.last_snd_ack = self.snd_ack;
+            self.rcv_ack = SeqNum(packet.get_acknowledgement());
+            self.snd_wnd = packet.get_window();
+            self.recv_syn_ack();
+            self.init_congestion_window();
+            let relay = self.create_option_transport_packet(ACK, &[], None);
+            return Some(relay);
         }
         None
     }
@@ -411,7 +409,7 @@ impl Tcb {
             let payload = tcp_option.payload();
             match tcp_option.get_number() {
                 TcpOptionNumbers::WSCALE => {
-                    if let Some(window_shift_cnt) = payload.get(0) {
+                    if let Some(window_shift_cnt) = payload.first() {
                         self.snd_window_shift_cnt = (*window_shift_cnt).min(14);
                     }
                 }
@@ -435,28 +433,25 @@ impl Tcb {
             return;
         }
         for tcp_option in tcp_packet.get_options_iter() {
-            match tcp_option.get_number() {
-                TcpOptionNumbers::SACK => {
-                    let payload = tcp_option.payload();
-                    if payload.len() & 7 != 0 {
-                        continue;
-                    }
-                    let n = payload.len() >> 3;
-                    for inflight_packet in self.inflight_packets.iter_mut() {
-                        for index in 0..n {
-                            let offset = index * 8;
-                            let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                            let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                            if inflight_packet.confirmed || inflight_packet.end() <= left {
-                                break;
-                            }
-                            if inflight_packet.start() >= left && inflight_packet.end() <= right {
-                                inflight_packet.confirmed = true;
-                            }
+            if tcp_option.get_number() == TcpOptionNumbers::SACK {
+                let payload = tcp_option.payload();
+                if payload.len() & 7 != 0 {
+                    continue;
+                }
+                let n = payload.len() >> 3;
+                for inflight_packet in self.inflight_packets.iter_mut() {
+                    for index in 0..n {
+                        let offset = index * 8;
+                        let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                        let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                        if inflight_packet.confirmed || inflight_packet.end() <= left {
+                            break;
+                        }
+                        if inflight_packet.start() >= left && inflight_packet.end() <= right {
+                            inflight_packet.confirmed = true;
                         }
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -472,10 +467,7 @@ impl Tcb {
         let data = self.create_packet(flags, seq, self.snd_ack.0, payload, None);
         TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
     }
-    fn create_transport_packet_seq_ack(&self, flags: u8, seq: u32, ack: u32, payload: &[u8]) -> TransportPacket {
-        let data = self.create_packet(flags, seq, ack, payload, None);
-        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
-    }
+
     fn create_packet(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], options: Option<&[u8]>) -> BytesMut {
         create_packet_raw(
             &self.local_addr,
@@ -493,10 +485,7 @@ impl Tcb {
 /// Implementation related to reading data
 impl Tcb {
     pub fn readable_state(&self) -> bool {
-        match self.state {
-            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => true,
-            _ => false,
-        }
+        matches!(self.state, TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2)
     }
     pub fn cannot_read(&self) -> bool {
         !self.readable_state()
@@ -515,6 +504,7 @@ impl Tcb {
         let header_len = packet.get_data_offset() as usize * 4;
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
+                self.relay_ack = true;
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
                     if acknowledgement == self.rcv_ack {
@@ -529,6 +519,10 @@ impl Tcb {
 
                     self.update_last_ack(&packet);
                     self.option_sack(&packet);
+                }
+                if self.recv_buffer_full() {
+                    // Packet loss occurs when the buffer is full
+                    return None;
                 }
                 let seq = SeqNum(packet.get_sequence());
                 if seq >= self.snd_ack {
@@ -569,12 +563,33 @@ impl Tcb {
         }
         self.error();
         let reply_packet = self.create_transport_packet(RST, &[]);
-        return Some(reply_packet);
+        Some(reply_packet)
     }
-    pub fn duplicate_ack_count(&self) -> usize {
-        self.duplicate_ack_count
+    pub fn readable(&self) -> bool {
+        if self.cannot_read() {
+            return false;
+        }
+        for packet in &self.unordered_packets {
+            let seq = packet.seq;
+            if self.snd_ack < seq {
+                //unordered
+                break;
+            }
+
+            let payload = &packet.payload;
+            let offset = (self.snd_ack - seq).0 as usize;
+            if offset < payload.len() {
+                return true;
+            }
+            let flags = packet.flags;
+
+            if flags & FIN == FIN {
+                return true;
+            }
+        }
+        false
     }
-    pub fn readable(&self) -> usize {
+    pub fn readable_bytes(&self) -> usize {
         if self.cannot_read() {
             return 0;
         }
@@ -680,11 +695,17 @@ impl Tcb {
         let unread_packet = UnreadPacket::new(seq, flags, payload);
         self.unordered_packets.push(unread_packet);
     }
-    fn recv_window(&self) -> u16 {
+    pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
         let unread_total_bytes = self.unordered_packets.total_bytes();
         let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
         (rcv_wnd >> self.rcv_window_shift_cnt) as u16
+    }
+    fn recv_buffer_full(&self) -> bool {
+        // To reduce packet loss, the actual receivable window size is larger than the recv_window()
+        let src_rcv_wnd = ((self.rcv_wnd as usize) << self.rcv_window_shift_cnt) << 1;
+        let unread_total_bytes = self.unordered_packets.total_bytes();
+        src_rcv_wnd <= unread_total_bytes
     }
 }
 
@@ -702,9 +723,10 @@ impl Tcb {
         wnd.saturating_sub(distance as usize)
     }
     pub fn need_ack(&self) -> bool {
-        self.snd_ack > self.last_snd_ack
+        self.relay_ack || self.snd_ack > self.last_snd_ack
     }
-    pub fn set_ack(&mut self) {
+    pub fn perform_post_ack_action(&mut self) {
+        self.relay_ack = false;
         self.last_snd_ack = self.snd_ack;
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
@@ -729,7 +751,7 @@ impl Tcb {
         if self.inflight_packets.is_empty() {
             self.write_timeout.take();
         } else if let Some(write_timeout) = self.write_timeout.as_mut() {
-            *write_timeout = *write_timeout + self.retransmission_timeout
+            *write_timeout += self.retransmission_timeout
         }
         if !self.writeable_state() && self.rcv_ack > self.snd_seq {
             self.recv_fin_ack()
@@ -763,7 +785,7 @@ impl Tcb {
         }
         let flags = if self.decelerate() { PSH | ACK } else { ACK };
         if let Some(packet) = self.inflight_packets.back_mut() {
-            let n = packet.write(&buf);
+            let n = packet.write(buf);
             if n > 0 {
                 let packet = self.create_transport_packet_seq(flags, seq, &buf[..n]);
                 self.snd_seq.add_update(n as u32);
@@ -772,7 +794,7 @@ impl Tcb {
         }
 
         if let Some(mut packet) = self.take_send_buf() {
-            let n = packet.write(&buf);
+            let n = packet.write(buf);
             assert!(n > 0);
             self.inflight_packets.push_back(packet);
             let packet = self.create_transport_packet_seq(flags, seq, &buf[..n]);
@@ -796,16 +818,14 @@ impl Tcb {
     }
 
     pub fn retransmission(&mut self) -> Option<TransportPacket> {
-        let Some(back_seq) = self.back_seq else {
-            return None;
-        };
+        let back_seq = self.back_seq?;
         for packet in self.inflight_packets.iter() {
             if packet.confirmed {
                 continue;
             }
-            if packet.seq == back_seq {
-                self.back_seq.replace(back_seq.add_num(packet.len() as u32));
-                return Some(self.create_transport_packet(ACK, packet.bytes()));
+            if packet.end() > back_seq {
+                self.back_seq.replace(packet.end());
+                return Some(self.create_transport_packet_seq(ACK, packet.start().0, packet.bytes()));
             }
         }
         self.back_seq.take();
@@ -813,7 +833,7 @@ impl Tcb {
     }
     fn back_n(&mut self) {
         if let Some(v) = self.inflight_packets.front() {
-            self.back_seq.replace(v.seq);
+            self.back_seq.replace(v.start());
             self.congestion_window.on_loss();
             self.reset_write_timeout();
         }
@@ -830,9 +850,6 @@ impl Tcb {
     }
     pub fn no_inflight_packet(&self) -> bool {
         self.inflight_packets.is_empty()
-    }
-    pub fn inflight_packet(&self) -> usize {
-        self.inflight_packets.len()
     }
     pub fn writeable_state(&self) -> bool {
         self.state == TcpState::Established || self.state == TcpState::CloseWait
@@ -952,7 +969,7 @@ pub fn create_transport_packet_raw(
     let data = create_packet_raw(local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload, None);
     TransportPacket::new(data, NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp))
 }
-
+#[allow(clippy::too_many_arguments)]
 pub fn create_packet_raw(
     local_addr: &SocketAddr,
     peer_addr: &SocketAddr,

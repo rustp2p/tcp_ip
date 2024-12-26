@@ -80,6 +80,6 @@ impl IcmpSocket {
 }
 impl Drop for IcmpSocket {
     fn drop(&mut self) {
-        _ = self.ip_stack.remove_socket(IpNextHeaderProtocols::Icmp, &self.local_addr);
+        self.ip_stack.remove_socket(IpNextHeaderProtocols::Icmp, &self.local_addr);
     }
 }
