@@ -251,7 +251,7 @@ impl TcpStreamReadHalf {
     fn try_read0(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         let mut rs = false;
         while buf.remaining() > 0 {
-            let Ok(mut p) = self.payload_receiver.try_recv()else {
+            let Ok(mut p) = self.payload_receiver.try_recv() else {
                 break;
             };
             rs = true;

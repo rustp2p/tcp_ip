@@ -113,7 +113,7 @@ impl TcpStreamTask {
                             break;
                         }
                         count += 1;
-                        if count >= 100 {
+                        if count >= 10 {
                             break;
                         }
                         if let Some(v) = self.try_recv_in() {
@@ -123,8 +123,11 @@ impl TcpStreamTask {
                         }
                     }
                     self.push_application_layer();
-
-                    self.try_send_ack().await?;
+                    if self.tcb.readable_state() && self.application_layer_sender.is_some() && self.tcb.recv_window() < self.mss() {
+                        // The window is too small and requires blocking to wait; otherwise, it will lead to severe packet loss
+                        self.read_notify.notified().await;
+                        self.push_application_layer();
+                    }
                 }
                 TaskRecvData::Out(buf) => {
                     self.write(buf).await?;
@@ -149,9 +152,13 @@ impl TcpStreamTask {
                 }
                 TaskRecvData::ReadNotify => {
                     self.push_application_layer();
+                    self.try_send_ack().await?;
                 }
             }
             self.retransmission = self.try_retransmission().await?;
+            if !self.retransmission {
+                self.try_send_ack().await?;
+            }
             self.tcb.perform_post_ack_action();
             if !self.read_half_closed() && self.tcb.cannot_read() {
                 self.close_read();
@@ -170,7 +177,7 @@ impl TcpStreamTask {
     fn push_application_layer(&mut self) {
         if let Some(sender) = self.application_layer_sender.as_ref() {
             let mut read_half_closed = false;
-            if self.tcb.readable() {
+            while self.tcb.readable() {
                 match sender.try_reserve() {
                     Ok(sender) => {
                         if let Some(buffer) = self.tcb.read() {
@@ -178,9 +185,10 @@ impl TcpStreamTask {
                         }
                     }
                     Err(e) => match e {
-                        TrySendError::Full(_) => {}
+                        TrySendError::Full(_) => break,
                         TrySendError::Closed(_) => {
                             read_half_closed = true;
+                            break;
                         }
                     },
                 }

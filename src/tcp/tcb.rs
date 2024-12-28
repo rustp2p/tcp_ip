@@ -72,7 +72,7 @@ pub struct Tcb {
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
-    tcp_receive_queue: TcpReceiveQueue,
+    pub tcp_receive_queue: TcpReceiveQueue,
     tcp_out_of_order_queue: TcpOfoQueue,
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
@@ -81,7 +81,7 @@ pub struct Tcb {
     retransmission_timeout: Duration,
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
-    relay_ack: bool,
+    last_snd_wnd: u16,
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -306,7 +306,7 @@ impl Tcb {
             retransmission_timeout: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
-            relay_ack: false,
+            last_snd_wnd: 0,
         }
     }
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
@@ -523,7 +523,6 @@ impl Tcb {
         let header_len = packet.get_data_offset() as usize * 4;
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
-                self.relay_ack = true;
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
                     if acknowledgement == self.rcv_ack {
@@ -629,18 +628,18 @@ impl Tcb {
         }
     }
     pub fn need_ack(&self) -> bool {
-        self.relay_ack || self.snd_ack > self.last_snd_ack
+        self.last_snd_wnd != self.rcv_wnd || self.snd_ack != self.last_snd_ack
     }
     pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
-        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes();
+        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
         (rcv_wnd >> self.rcv_window_shift_cnt) as u16
     }
     fn recv_buffer_full(&self) -> bool {
         // To reduce packet loss, the actual receivable window size is larger than the recv_window()
         let src_rcv_wnd = ((self.rcv_wnd as usize) << self.rcv_window_shift_cnt) << 1;
-        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes();
+        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
 }
@@ -660,7 +659,7 @@ impl Tcb {
     }
 
     pub fn perform_post_ack_action(&mut self) {
-        self.relay_ack = false;
+        self.last_snd_wnd = self.rcv_wnd;
         self.last_snd_ack = self.snd_ack;
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
