@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
 pub use tcb::TcpConfig;
+
 mod sys;
 mod tcb;
 mod tcp_queue;
@@ -32,11 +33,13 @@ pub struct TcpStream {
     read: TcpStreamReadHalf,
     write: TcpStreamWriteHalf,
 }
+
 pub struct TcpStreamReadHalf {
     read_notify: ReadNotify,
     last_buf: Option<BytesMut>,
     payload_receiver: Receiver<BytesMut>,
 }
+
 pub struct TcpStreamWriteHalf {
     mss: usize,
     payload_sender: PollSender<BytesMut>,
@@ -205,6 +208,7 @@ impl AsyncRead for TcpStream {
         Pin::new(&mut self.read).poll_read(cx, buf)
     }
 }
+
 impl AsyncRead for TcpStreamReadHalf {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         if let Some(p) = self.last_buf.as_mut() {
@@ -213,6 +217,9 @@ impl AsyncRead for TcpStreamReadHalf {
             p.advance(len);
             if p.is_empty() {
                 self.last_buf.take();
+                if self.try_read0(buf) {
+                    self.read_notify.notify();
+                }
             }
             return Poll::Ready(Ok(()));
         }
@@ -227,7 +234,9 @@ impl AsyncRead for TcpStreamReadHalf {
                 let len = buf.remaining().min(p.len());
                 buf.put_slice(&p[..len]);
                 p.advance(len);
-                if !p.is_empty() {
+                if p.is_empty() {
+                    self.try_read0(buf);
+                } else {
                     self.last_buf.replace(p);
                 }
                 self.read_notify.notify();
@@ -237,6 +246,30 @@ impl AsyncRead for TcpStreamReadHalf {
         }
     }
 }
+
+impl TcpStreamReadHalf {
+    fn try_read0(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        let mut rs = false;
+        while buf.remaining() > 0 {
+            let Ok(mut p) = self.payload_receiver.try_recv()else {
+                break;
+            };
+            rs = true;
+            if p.is_empty() {
+                self.payload_receiver.close();
+                break;
+            }
+            let len = buf.remaining().min(p.len());
+            buf.put_slice(&p[..len]);
+            p.advance(len);
+            if !p.is_empty() {
+                self.last_buf.replace(p);
+            }
+        }
+        rs
+    }
+}
+
 impl AsyncWrite for TcpStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         Pin::new(&mut self.write).poll_write(cx, buf)
@@ -250,6 +283,7 @@ impl AsyncWrite for TcpStream {
         Pin::new(&mut self.write).poll_shutdown(cx)
     }
 }
+
 impl AsyncWrite for TcpStreamWriteHalf {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         if buf.is_empty() {
