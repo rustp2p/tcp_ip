@@ -99,15 +99,30 @@ impl TcpStreamTask {
             let data = self.recv_data().await;
 
             match data {
-                TaskRecvData::In(buf) => {
-                    if let Some(reply_packet) = self.tcb.push_packet(buf) {
-                        self.ip_stack.send_packet(reply_packet).await?;
+                TaskRecvData::In(mut buf) => {
+                    let mut count = 0;
+                    loop {
+                        if let Some(reply_packet) = self.tcb.push_packet(buf) {
+                            self.ip_stack.send_packet(reply_packet).await?;
+                        }
+
+                        if self.tcb.is_close() {
+                            return Ok(());
+                        }
+                        if !self.tcb.readable_state() {
+                            break;
+                        }
+                        count += 1;
+                        if count >= 100 {
+                            break;
+                        }
+                        if let Some(v) = self.try_recv_in() {
+                            buf = v
+                        } else {
+                            break;
+                        }
                     }
                     self.push_application_layer();
-
-                    if self.tcb.is_close() {
-                        return Ok(());
-                    }
 
                     self.try_send_ack().await?;
                 }
@@ -154,15 +169,11 @@ impl TcpStreamTask {
     }
     fn push_application_layer(&mut self) {
         if let Some(sender) = self.application_layer_sender.as_ref() {
-            let len = self.tcb.readable_bytes();
             let mut read_half_closed = false;
-            if len > 0 {
+            if self.tcb.readable() {
                 match sender.try_reserve() {
                     Ok(sender) => {
-                        let mut buffer = BytesMut::zeroed(len.min(1024 * 1024));
-                        let len = self.tcb.read(&mut buffer);
-                        buffer.truncate(len);
-                        if !buffer.is_empty() {
+                        if let Some(buffer) = self.tcb.read() {
                             sender.send(buffer);
                         }
                     }
@@ -327,6 +338,9 @@ impl TcpStreamTask {
                 TaskRecvData::ReadNotify
             }
         }
+    }
+    fn try_recv_in(&mut self) -> Option<BytesMut> {
+        self.packet_receiver.try_recv().map(|v| v.buf).ok()
     }
 }
 

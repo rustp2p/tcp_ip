@@ -1,12 +1,12 @@
 #![allow(unused, unused_variables)]
 use crate::tcp::tcb::UnreadPacket;
+use bytes::{Buf, BytesMut};
 use std::cmp::Ordering;
 use std::collections::LinkedList;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use bytes::{Buf, BytesMut};
 
 #[derive(Debug, Default)]
 pub(crate) struct TcpReceiveQueue {

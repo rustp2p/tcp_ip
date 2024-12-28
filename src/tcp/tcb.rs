@@ -580,33 +580,12 @@ impl Tcb {
     pub fn readable(&self) -> bool {
         self.tcp_receive_queue.total_bytes() != 0
     }
-    pub fn readable_bytes(&self) -> usize {
-        self.tcp_receive_queue.total_bytes()
-    }
     pub fn read_none(&mut self) {
         self.rcv_wnd = 0;
         self.tcp_receive_queue.clear();
     }
-    pub fn read(&mut self, mut buf: &mut [u8]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-        let len = buf.len();
-        while let Some(mut payload) = self.tcp_receive_queue.peek() {
-            let min = buf.len().min(payload.len());
-            buf[..min].copy_from_slice(&payload[..min]);
-            buf = &mut buf[min..];
-            payload.advance(min);
-            if payload.is_empty() {
-                self.tcp_receive_queue.pop();
-            } else {
-                break;
-            }
-            if buf.is_empty() {
-                break;
-            }
-        }
-        len - buf.len()
+    pub fn read(&mut self) -> Option<BytesMut> {
+        self.tcp_receive_queue.pop()
     }
 
     fn recv(&mut self, mut unread_packet: UnreadPacket) {
