@@ -17,7 +17,7 @@ use tokio_util::sync::PollSender;
 pub use tcb::TcpConfig;
 mod sys;
 mod tcb;
-mod tcp_ofo_queue;
+mod tcp_queue;
 
 pub struct TcpListener {
     ip_stack: IpStack,

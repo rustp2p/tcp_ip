@@ -1,10 +1,63 @@
 #![allow(unused, unused_variables)]
 use crate::tcp::tcb::UnreadPacket;
 use std::cmp::Ordering;
+use std::collections::LinkedList;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Deref;
 use std::ptr::NonNull;
+use bytes::{Buf, BytesMut};
 
+#[derive(Debug, Default)]
+pub(crate) struct TcpReceiveQueue {
+    total_bytes: usize,
+    queue: LinkedList<BytesMut>,
+}
+pub(crate) struct TcpReceiveQueueItem<'a> {
+    total_bytes: &'a mut usize,
+    payload: &'a mut BytesMut,
+}
+impl Deref for TcpReceiveQueueItem<'_> {
+    type Target = BytesMut;
+
+    fn deref(&self) -> &Self::Target {
+        self.payload
+    }
+}
+impl TcpReceiveQueueItem<'_> {
+    pub fn advance(&mut self, cnt: usize) {
+        self.payload.advance(cnt);
+        *self.total_bytes -= cnt;
+    }
+}
+impl TcpReceiveQueue {
+    pub fn push(&mut self, elt: BytesMut) {
+        self.total_bytes += elt.len();
+        self.queue.push_back(elt);
+    }
+    pub fn pop(&mut self) -> Option<BytesMut> {
+        if let Some(v) = self.queue.pop_front() {
+            self.total_bytes -= v.len();
+            Some(v)
+        } else {
+            None
+        }
+    }
+    pub fn peek(&mut self) -> Option<TcpReceiveQueueItem> {
+        let total_bytes = &mut self.total_bytes;
+        self.queue.front_mut().map(|payload| TcpReceiveQueueItem { total_bytes, payload })
+    }
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.total_bytes = 0;
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
 #[derive(Debug, Default)]
 pub(crate) struct TcpOfoQueue {
     total_bytes: usize,

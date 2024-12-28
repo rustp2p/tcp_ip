@@ -27,11 +27,13 @@ pub struct TcpStreamTask {
     retransmission: bool,
     read_notify: ReadNotify,
 }
+
 #[derive(Clone, Default, Debug)]
 pub struct ReadNotify {
     readable: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
+
 impl ReadNotify {
     pub fn notify(&self) {
         if self.readable.load(Ordering::Acquire) {
@@ -106,6 +108,8 @@ impl TcpStreamTask {
                     if self.tcb.is_close() {
                         return Ok(());
                     }
+
+                    self.try_send_ack().await?;
                 }
                 TaskRecvData::Out(buf) => {
                     self.write(buf).await?;
@@ -132,12 +136,7 @@ impl TcpStreamTask {
                     self.push_application_layer();
                 }
             }
-            if self.try_retransmission().await? {
-                self.retransmission = true;
-            } else {
-                self.retransmission = false;
-                self.try_send_ack().await?;
-            }
+            self.retransmission = self.try_retransmission().await?;
             self.tcb.perform_post_ack_action();
             if !self.read_half_closed() && self.tcb.cannot_read() {
                 self.close_read();

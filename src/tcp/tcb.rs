@@ -14,7 +14,7 @@ use rand::RngCore;
 
 use crate::buffer::FixedBuffer;
 use crate::ip_stack::{NetworkTuple, TransportPacket};
-use crate::tcp::tcp_ofo_queue::TcpOfoQueue;
+use crate::tcp::tcp_queue::{TcpOfoQueue, TcpReceiveQueue};
 
 const IP_HEADER_LEN: usize = 20;
 const TCP_HEADER_LEN: usize = 20;
@@ -72,7 +72,8 @@ pub struct Tcb {
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
-    unordered_packets: TcpOfoQueue,
+    tcp_receive_queue: TcpReceiveQueue,
+    tcp_out_of_order_queue: TcpOfoQueue,
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
     time_wait: Option<Instant>,
@@ -177,7 +178,24 @@ impl UnreadPacket {
         Self { seq, flags, payload }
     }
     pub(crate) fn len(&self) -> usize {
-        self.payload.len()
+        if self.flags & FIN == FIN {
+            self.payload.len() + 1
+        } else {
+            self.payload.len()
+        }
+    }
+    fn advance(&mut self, cnt: usize) {
+        self.seq.add_update(cnt as u32);
+        self.payload.advance(cnt)
+    }
+    fn start(&self) -> SeqNum {
+        self.seq
+    }
+    fn end(&self) -> SeqNum {
+        self.seq.add_num(self.payload.len() as u32)
+    }
+    fn into_bytes(self) -> BytesMut {
+        self.payload
     }
 }
 
@@ -239,7 +257,7 @@ impl Default for TcpConfig {
             mss: None,
             rcv_wnd: u16::MAX,
             // Window size too large can cause packet loss
-            window_shift_cnt: 2,
+            window_shift_cnt: 4,
         }
     }
 }
@@ -279,7 +297,8 @@ impl Tcb {
             rcv_window_shift_cnt: config.window_shift_cnt,
             duplicate_ack_count: 0,
             // rcv_seq: SeqNum(0),
-            unordered_packets: Default::default(),
+            tcp_receive_queue: Default::default(),
+            tcp_out_of_order_queue: Default::default(),
             back_seq: None,
             inflight_packets: Default::default(),
             time_wait: None,
@@ -345,7 +364,8 @@ impl Tcb {
             if !packet.payload().is_empty() {
                 let seq = SeqNum(packet.get_sequence());
                 buf.advance(header_len);
-                self.recv(seq, flags, buf)
+                let unread_packet = UnreadPacket::new(seq, flags, buf);
+                self.recv(unread_packet)
             }
             return true;
         }
@@ -487,7 +507,7 @@ impl Tcb {
         matches!(self.state, TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2)
     }
     pub fn cannot_read(&self) -> bool {
-        !self.readable_state()
+        !self.readable_state() && !self.readable()
     }
 
     pub fn push_packet(&mut self, mut buf: BytesMut) -> Option<TransportPacket> {
@@ -519,20 +539,18 @@ impl Tcb {
                     self.update_last_ack(&packet);
                     self.option_sack(&packet);
                 }
+                let seq = SeqNum(packet.get_sequence());
+                buf.advance(header_len);
+                let unread_packet = UnreadPacket::new(seq, flags, buf);
+                if self.rcv_wnd == 0 {
+                    self.snd_ack = unread_packet.end();
+                }
                 if self.recv_buffer_full() {
                     // Packet loss occurs when the buffer is full
                     return None;
                 }
-                let seq = SeqNum(packet.get_sequence());
-                if seq >= self.snd_ack {
-                    if flags & FIN == FIN && self.unordered_packets.is_empty() {
-                        self.recv_fin();
-                        let reply_packet = self.create_transport_packet(ACK, &[]);
-                        return Some(reply_packet);
-                    } else {
-                        buf.advance(header_len);
-                        self.recv(seq, flags, buf)
-                    }
+                if unread_packet.end() >= self.snd_ack {
+                    self.recv(unread_packet);
                 }
                 return None;
             }
@@ -560,145 +578,90 @@ impl Tcb {
         Some(reply_packet)
     }
     pub fn readable(&self) -> bool {
-        if self.cannot_read() {
-            return false;
-        }
-        for packet in &self.unordered_packets {
-            let seq = packet.seq;
-            if self.snd_ack < seq {
-                //unordered
-                break;
-            }
-
-            let payload = &packet.payload;
-            let offset = (self.snd_ack - seq).0 as usize;
-            if offset < payload.len() {
-                return true;
-            }
-            let flags = packet.flags;
-
-            if flags & FIN == FIN {
-                return true;
-            }
-        }
-        false
+        self.tcp_receive_queue.total_bytes() != 0
     }
     pub fn readable_bytes(&self) -> usize {
-        if self.cannot_read() {
-            return 0;
-        }
-        let mut len = 0;
-        for packet in &self.unordered_packets {
-            let seq = packet.seq;
-            if self.snd_ack < seq {
-                //unordered
-                break;
-            }
-
-            let payload = &packet.payload;
-            let offset = (self.snd_ack - seq).0 as usize;
-            if offset < payload.len() {
-                len += payload.len() - offset;
-            }
-            let flags = packet.flags;
-
-            if flags & FIN == FIN {
-                len += 1;
-                break;
-            }
-        }
-        len
+        self.tcp_receive_queue.total_bytes()
     }
     pub fn read_none(&mut self) {
-        let mut fin = false;
         self.rcv_wnd = 0;
-        while let Some(packet) = self.unordered_packets.peek() {
-            let seq = packet.seq;
-            let flags = packet.flags;
-            let payload = &packet.payload;
-            if self.snd_ack < seq {
-                //unordered
-                break;
-            }
-
-            let offset = (self.snd_ack - seq).0 as usize;
-            if offset >= payload.len() {
-                self.unordered_packets.pop();
-            } else {
-                let count = payload.len() - offset;
-                self.snd_ack.add_update(count as u32);
-                self.unordered_packets.pop();
-            }
-            if flags & FIN == FIN {
-                fin = true;
-                break;
-            }
-        }
-        if fin {
-            // Processing FIN flags
-            self.recv_fin();
-            self.unordered_packets.clear();
-        }
+        self.tcp_receive_queue.clear();
     }
     pub fn read(&mut self, mut buf: &mut [u8]) -> usize {
         if buf.is_empty() {
             return 0;
         }
         let len = buf.len();
-        let mut fin = false;
-        while let Some(packet) = self.unordered_packets.peek() {
-            let seq = packet.seq;
-            let flags = packet.flags;
-            let payload = &packet.payload;
-            if self.snd_ack < seq {
-                //unordered
-                break;
-            }
-
-            let offset = (self.snd_ack - seq).0 as usize;
-            if offset >= payload.len() {
-                self.unordered_packets.pop();
+        while let Some(mut payload) = self.tcp_receive_queue.peek() {
+            let min = buf.len().min(payload.len());
+            buf[..min].copy_from_slice(&payload[..min]);
+            buf = &mut buf[min..];
+            payload.advance(min);
+            if payload.is_empty() {
+                self.tcp_receive_queue.pop();
             } else {
-                let count = payload.len() - offset;
-                let min = buf.len().min(count);
-                buf[..min].copy_from_slice(&payload[offset..offset + min]);
-                buf = &mut buf[min..];
-                self.snd_ack = self.snd_ack.add_num(min as u32);
-                if min == count {
-                    self.unordered_packets.pop();
-                }
-            }
-
-            if flags & FIN == FIN {
-                fin = true;
                 break;
             }
             if buf.is_empty() {
                 break;
             }
         }
-        if fin {
-            // Processing FIN flags
-            self.recv_fin();
-            self.unordered_packets.clear();
-        }
         len - buf.len()
     }
 
-    fn recv(&mut self, seq: SeqNum, flags: u8, payload: BytesMut) {
-        let unread_packet = UnreadPacket::new(seq, flags, payload);
-        self.unordered_packets.push(unread_packet);
+    fn recv(&mut self, mut unread_packet: UnreadPacket) {
+        let start = unread_packet.start();
+        if self.snd_ack >= start {
+            let flags = unread_packet.flags;
+            let end = unread_packet.end();
+            if end > self.snd_ack {
+                unread_packet.advance((self.snd_ack - start).0 as usize);
+                self.snd_ack = end;
+                self.tcp_receive_queue.push(unread_packet.into_bytes())
+            }
+            if flags & FIN == FIN {
+                self.recv_fin();
+            }
+        } else {
+            self.tcp_out_of_order_queue.push(unread_packet);
+            self.advice_ack();
+        }
+    }
+    fn advice_ack(&mut self) {
+        while let Some(packet) = self.tcp_out_of_order_queue.peek() {
+            let start = packet.start();
+            if self.snd_ack < start {
+                //unordered
+                break;
+            }
+            let flags = packet.flags;
+            let end = packet.end();
+            let mut unread_packet = self.tcp_out_of_order_queue.pop().unwrap();
+            if end > self.snd_ack {
+                let offset = (self.snd_ack - start).0;
+                self.snd_ack = end;
+                unread_packet.advance(offset as usize);
+                self.tcp_receive_queue.push(unread_packet.into_bytes());
+            }
+            if flags & FIN == FIN {
+                self.recv_fin();
+                break;
+            }
+        }
+    }
+    pub fn need_ack(&self) -> bool {
+        self.relay_ack || self.snd_ack > self.last_snd_ack
     }
     pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
-        let unread_total_bytes = self.unordered_packets.total_bytes();
+        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes();
         let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
         (rcv_wnd >> self.rcv_window_shift_cnt) as u16
     }
     fn recv_buffer_full(&self) -> bool {
         // To reduce packet loss, the actual receivable window size is larger than the recv_window()
         let src_rcv_wnd = ((self.rcv_wnd as usize) << self.rcv_window_shift_cnt) << 1;
-        let unread_total_bytes = self.unordered_packets.total_bytes();
+        let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
 }
@@ -716,9 +679,7 @@ impl Tcb {
         // log::info!("snd_wnd1 ={snd_wnd1} snd_wnd = {snd_wnd:?},distance={distance}");
         wnd.saturating_sub(distance as usize)
     }
-    pub fn need_ack(&self) -> bool {
-        self.relay_ack || self.snd_ack > self.last_snd_ack
-    }
+
     pub fn perform_post_ack_action(&mut self) {
         self.relay_ack = false;
         self.last_snd_ack = self.snd_ack;
@@ -961,6 +922,7 @@ pub fn create_transport_packet_raw(
     let data = create_packet_raw(local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload, None);
     TransportPacket::new(data, NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp))
 }
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_packet_raw(
     local_addr: &SocketAddr,
