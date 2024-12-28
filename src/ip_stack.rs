@@ -62,10 +62,10 @@ impl Default for IpStackConfig {
             mtu: 1500,
             ip_fragment_timeout: Duration::from_secs(10),
             tcp_config: Default::default(),
-            channel_size: 128,
+            channel_size: 1024,
             tcp_syn_channel_size: 128,
-            tcp_channel_size: 128,
-            udp_channel_size: 128,
+            tcp_channel_size: 2048,
+            udp_channel_size: 1024,
             icmp_channel_size: 16,
         }
     }
