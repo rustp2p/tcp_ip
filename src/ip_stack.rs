@@ -174,6 +174,19 @@ impl IdKey {
     }
 }
 
+/// Create a user-space protocol stack.
+///
+/// # Examples
+/// ```rust
+/// use tcp_ip::tcp::TcpListener;
+/// async fn main(){
+///     let (ip_stack, ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
+///     // Use ip_stack_send and ip_stack_recv to interface
+///     // with the input and output of IP packets.
+///     // ...
+///     let mut tcp_listener = TcpListener::bind_all(ip_stack.clone()).await?;
+/// }
+/// ```
 pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStackRecv)> {
     config.check()?;
     let (packet_sender, packet_receiver) = channel(config.channel_size);
@@ -282,6 +295,7 @@ impl IpStack {
 }
 
 impl IpStackSend {
+    /// Send the IP packet to this protocol stack.
     pub async fn send_ip_packet(&mut self, buf: &[u8]) -> io::Result<()> {
         let p = buf[0] >> 4;
         match p {
@@ -464,6 +478,7 @@ impl IpStackSend {
 }
 
 impl IpStackRecv {
+    /// Read a single IP packet from the protocol stack.
     pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.num > self.index {
@@ -492,6 +507,7 @@ impl IpStackRecv {
             }
         }
     }
+    /// Read multiple IP packets from the protocol stack at once.
     pub async fn recv_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize]) -> io::Result<usize> {
         self.inner.recv_ip_packet(bufs, sizes).await
     }
