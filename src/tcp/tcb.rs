@@ -20,7 +20,6 @@ const IP_HEADER_LEN: usize = 20;
 const TCP_HEADER_LEN: usize = 20;
 pub const IP_TCP_HEADER_LEN: usize = IP_HEADER_LEN + TCP_HEADER_LEN;
 const MAX_DIFF: u32 = u32::MAX / 2;
-const MAX_PACKETS: usize = 256;
 const MSS_MIN: u16 = 536;
 
 /// Enum representing the various states of a TCP connection.
@@ -77,6 +76,7 @@ pub struct Tcb {
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
     time_wait: Option<Instant>,
+    time_wait_timeout: Duration,
     write_timeout: Option<Instant>,
     retransmission_timeout: Duration,
     timeout_count: (AckNum, usize),
@@ -245,6 +245,7 @@ impl InflightPacket {
 #[derive(Debug, Clone, Copy)]
 pub struct TcpConfig {
     pub retransmission_timeout: Duration,
+    pub time_wait_timeout: Duration,
     pub mss: Option<u16>,
     pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
@@ -254,10 +255,11 @@ impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
+            time_wait_timeout: Duration::from_secs(120),
             mss: None,
             rcv_wnd: u16::MAX,
             // Window size too large can cause packet loss
-            window_shift_cnt: 4,
+            window_shift_cnt: 2,
         }
     }
 }
@@ -302,6 +304,7 @@ impl Tcb {
             back_seq: None,
             inflight_packets: Default::default(),
             time_wait: None,
+            time_wait_timeout: config.time_wait_timeout,
             write_timeout: None,
             retransmission_timeout: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
@@ -567,6 +570,7 @@ impl Tcb {
                     let reply_packet = self.create_transport_packet(ACK, &[]);
                     return Some(reply_packet);
                 }
+                return None;
             }
             _ => {
                 // RST
@@ -628,7 +632,7 @@ impl Tcb {
         }
     }
     pub fn need_ack(&self) -> bool {
-        self.last_snd_wnd != self.rcv_wnd || self.snd_ack != self.last_snd_ack
+        self.last_snd_wnd != self.recv_window() || self.snd_ack != self.last_snd_ack
     }
     pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
@@ -642,6 +646,15 @@ impl Tcb {
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
+    // pub fn recv_busy(&self) -> bool {
+    //     if !self.readable_state() || self.rcv_wnd == 0 {
+    //         return false;
+    //     }
+    //     let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
+    //     let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
+    //     let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
+    //     rcv_wnd <= 2 * self.mss as usize
+    // }
 }
 
 /// Implementation related to writing data
@@ -659,7 +672,7 @@ impl Tcb {
     }
 
     pub fn perform_post_ack_action(&mut self) {
-        self.last_snd_wnd = self.rcv_wnd;
+        self.last_snd_wnd = self.recv_window();
         self.last_snd_ack = self.snd_ack;
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
@@ -692,12 +705,8 @@ impl Tcb {
         self.reset_write_timeout();
     }
     fn take_send_buf(&mut self) -> Option<InflightPacket> {
-        if self.inflight_packets.len() >= MAX_PACKETS {
-            None
-        } else {
-            let bytes_mut = FixedBuffer::with_capacity(self.mss as usize);
-            Some(InflightPacket::new(self.snd_seq, bytes_mut))
-        }
+        let bytes_mut = FixedBuffer::with_capacity(self.mss as usize);
+        Some(InflightPacket::new(self.snd_seq, bytes_mut))
     }
     pub fn write(&mut self, buf: &[u8]) -> Option<(TransportPacket, usize)> {
         let rs = self.write0(buf);
@@ -854,7 +863,7 @@ impl Tcb {
             }
             TcpState::FinWait2 => {
                 self.snd_ack.add_update(1);
-                self.time_wait = Some(Instant::now() + Duration::from_secs(120));
+                self.time_wait = Some(Instant::now() + self.time_wait_timeout);
                 self.state = TcpState::TimeWait
             }
             _ => {}

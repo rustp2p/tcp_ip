@@ -103,7 +103,7 @@ impl TcpStreamTask {
                     let mut count = 0;
                     loop {
                         if let Some(reply_packet) = self.tcb.push_packet(buf) {
-                            self.ip_stack.send_packet(reply_packet).await?;
+                            self.send_packet(reply_packet).await?;
                         }
 
                         if self.tcb.is_close() {
@@ -123,11 +123,11 @@ impl TcpStreamTask {
                         }
                     }
                     self.push_application_layer();
-                    if self.tcb.readable_state() && self.application_layer_sender.is_some() && self.tcb.recv_window() < self.mss() {
-                        // The window is too small and requires blocking to wait; otherwise, it will lead to severe packet loss
-                        self.read_notify.notified().await;
-                        self.push_application_layer();
-                    }
+                    // if self.tcb.readable_state() && self.application_layer_sender.is_some() && self.tcb.readable() && self.tcb.recv_busy() {
+                    //     // The window is too small and requires blocking to wait; otherwise, it will lead to severe packet loss
+                    //     self.read_notify.notified().await;
+                    //     self.push_application_layer();
+                    // }
                 }
                 TaskRecvData::Out(buf) => {
                     self.write(buf).await?;
@@ -137,7 +137,7 @@ impl TcpStreamTask {
                     assert!(self.last_buffer.is_none());
                     self.write_half_closed = true;
                     let packet = self.tcb.fin_packet();
-                    self.ip_stack.send_packet(packet).await?;
+                    self.send_packet(packet).await?;
                     self.tcb.sent_fin();
                 }
                 TaskRecvData::Timeout => {
@@ -147,7 +147,7 @@ impl TcpStreamTask {
                     }
                     if self.tcb.cannot_write() {
                         let packet = self.tcb.fin_packet();
-                        self.ip_stack.send_packet(packet).await?;
+                        self.send_packet(packet).await?;
                     }
                 }
                 TaskRecvData::ReadNotify => {
@@ -156,14 +156,17 @@ impl TcpStreamTask {
                 }
             }
             self.retransmission = self.try_retransmission().await?;
-            if !self.retransmission {
-                self.try_send_ack().await?;
-            }
+            self.try_send_ack().await?;
             self.tcb.perform_post_ack_action();
             if !self.read_half_closed() && self.tcb.cannot_read() {
                 self.close_read();
             }
         }
+    }
+    async fn send_packet(&mut self, transport_packet: TransportPacket) -> io::Result<()> {
+        self.ip_stack.send_packet(transport_packet).await?;
+        self.tcb.perform_post_ack_action();
+        Ok(())
     }
     fn read_half_closed(&self) -> bool {
         self.application_layer_sender.is_none()
@@ -214,6 +217,7 @@ impl TcpStreamTask {
                     break;
                 }
                 ip_stack.send_packet(packet).await?;
+                tcb.perform_post_ack_action();
                 buf = &buf[len..];
             } else {
                 break;
@@ -250,7 +254,7 @@ impl TcpStreamTask {
             return Ok(false);
         }
         if let Some(v) = self.tcb.retransmission() {
-            self.ip_stack.send_packet(v).await?;
+            self.send_packet(v).await?;
             return Ok(true);
         }
         if self.tcb.no_inflight_packet() {
@@ -258,7 +262,7 @@ impl TcpStreamTask {
         }
         if self.tcb.need_retransmission() {
             if let Some(v) = self.tcb.retransmission() {
-                self.ip_stack.send_packet(v).await?;
+                self.send_packet(v).await?;
                 return Ok(true);
             }
         }
@@ -360,11 +364,11 @@ impl TcpStreamTask {
             if count > 50 {
                 break;
             }
-            self.ip_stack.send_packet(packet).await?;
+            self.send_packet(packet).await?;
             return match self.recv_in_timeout(Duration::from_millis(5000)).await {
                 TaskRecvData::In(buf) => {
                     if let Some(relay) = self.tcb.try_syn_sent_to_established(buf) {
-                        self.ip_stack.send_packet(relay).await?;
+                        self.send_packet(relay).await?;
                         Ok(())
                     } else {
                         Err(io::Error::from(io::ErrorKind::ConnectionRefused))
