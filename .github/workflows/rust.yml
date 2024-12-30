@@ -1,0 +1,29 @@
+name: Push or PR
+
+on:
+  [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_n_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: check
+        run: cargo check --verbose
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: build
+        run: cargo build --verbose --examples --tests --all-features
+      - name: test
+        run: cargo test --all-features --examples
