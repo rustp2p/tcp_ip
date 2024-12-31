@@ -408,7 +408,10 @@ impl IpStackSend {
     }
     fn prepare_ip_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
         let offset = ip_packet.get_fragment_offset();
-        let network_tuple = if offset == 0 {
+        let network_tuple = if offset == 0
+            || (ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Udp
+                && ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Tcp)
+        {
             // No segmentation or the first segmentation
             convert_network_tuple(ip_packet)?
         } else {
