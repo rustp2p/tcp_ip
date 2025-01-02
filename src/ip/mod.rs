@@ -87,6 +87,11 @@ impl Ipv4Socket {
         self.send_protocol_from_to(buf, protocol, src, dst).await
     }
     pub async fn send_protocol_from_to(&self, buf: &[u8], protocol: IpNextHeaderProtocol, src: IpAddr, dst: IpAddr) -> io::Result<usize> {
+        if let Some(p) = self.protocol {
+            if p != protocol {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "inconsistent protocol"));
+            }
+        }
         if buf.len() > u16::MAX as usize - 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "buf too long"));
         }
