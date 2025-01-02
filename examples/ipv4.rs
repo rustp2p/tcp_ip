@@ -36,11 +36,13 @@ pub async fn main() -> anyhow::Result<()> {
     });
     let dev1 = dev.clone();
     let h2 = tokio::spawn(async {
+        // Reads packet from TUN and sends to stack.
         if let Err(e) = tun_to_ip_stack(dev1, ip_stack_send).await {
             log::error!("tun_to_ip_stack {e:?}");
         }
     });
     let h3 = tokio::spawn(async {
+        // Reads packet from stack and sends to TUN.
         if let Err(e) = ip_stack_to_tun(ip_stack_recv, dev).await {
             log::error!("ip_stack_to_tun {e:?}");
         }
