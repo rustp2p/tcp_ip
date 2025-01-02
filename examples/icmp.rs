@@ -26,7 +26,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let h1 = tokio::spawn(async {
         if let Err(e) = icmp_recv(icmp_socket).await {
-            log::error!("udp {e:?}");
+            log::error!("icmp {e:?}");
         }
     });
     let dev1 = dev.clone();
