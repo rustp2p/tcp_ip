@@ -26,6 +26,7 @@ pub struct IpStackConfig {
     pub tcp_channel_size: usize,
     pub udp_channel_size: usize,
     pub icmp_channel_size: usize,
+    pub ip_channel_size: usize,
 }
 
 impl IpStackConfig {
@@ -52,6 +53,9 @@ impl IpStackConfig {
         if self.icmp_channel_size == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "icmp_channel_size is zero"));
         }
+        if self.ip_channel_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_channel_size is zero"));
+        }
         self.tcp_config.check()
     }
 }
@@ -66,7 +70,8 @@ impl Default for IpStackConfig {
             tcp_syn_channel_size: 128,
             tcp_channel_size: 2048,
             udp_channel_size: 1024,
-            icmp_channel_size: 16,
+            icmp_channel_size: 128,
+            ip_channel_size: 128,
         }
     }
 }
@@ -82,7 +87,7 @@ pub(crate) struct IpStackInner {
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<SocketAddr, Sender<TransportPacket>>,
     pub(crate) udp_socket_map: DashMap<SocketAddr, flume::Sender<TransportPacket>>,
-    pub(crate) icmp_socket_map: DashMap<SocketAddr, flume::Sender<TransportPacket>>,
+    pub(crate) raw_socket_map: DashMap<(IpNextHeaderProtocol, SocketAddr), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
 }
 
@@ -236,7 +241,7 @@ impl IpStack {
                 tcp_stream_map: Default::default(),
                 tcp_listener_map: Default::default(),
                 udp_socket_map: Default::default(),
-                icmp_socket_map: Default::default(),
+                raw_socket_map: Default::default(),
                 packet_sender,
             }),
         }
@@ -249,8 +254,7 @@ impl IpStack {
     ) -> io::Result<()> {
         match protocol {
             IpNextHeaderProtocols::Udp => Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender),
-            IpNextHeaderProtocols::Icmp => Self::add_socket0(&self.inner.icmp_socket_map, local_addr, packet_sender),
-            _ => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            protocol => Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender),
         }
     }
     pub(crate) fn add_tcp_listener(&self, local_addr: SocketAddr, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
@@ -270,10 +274,9 @@ impl IpStack {
             IpNextHeaderProtocols::Udp => {
                 self.inner.udp_socket_map.remove(local_addr);
             }
-            IpNextHeaderProtocols::Icmp => {
-                self.inner.icmp_socket_map.remove(local_addr);
+            protocol => {
+                self.inner.raw_socket_map.remove(&(protocol, *local_addr));
             }
-            _ => {}
         }
     }
     fn add_socket0<K: Eq + PartialEq + Hash, V>(map: &DashMap<K, V>, local_addr: K, packet_sender: V) -> io::Result<()> {
@@ -310,10 +313,9 @@ impl IpStackSend {
                     return Ok(());
                 };
                 let sender = match packet.get_next_level_protocol() {
-                    IpNextHeaderProtocols::Tcp => self.get_tcp_sender(network_tuple),
-                    IpNextHeaderProtocols::Udp => self.get_udp_sender(network_tuple),
-                    IpNextHeaderProtocols::Icmp => self.get_icmp_sender(network_tuple),
-                    protocol => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("protocol={protocol}"))),
+                    IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
+                    IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
+                    protocol => self.get_raw_sender(protocol, &network_tuple),
                 };
                 if let Some(sender) = sender {
                     let rs = self.transmit_ip_packet(sender, packet, id_key, network_tuple).await;
@@ -330,9 +332,9 @@ impl IpStackSend {
             _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
         }
     }
-    fn get_tcp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_tcp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
-        if let Some(tcp) = stack.tcp_stream_map.get(&network_tuple) {
+        if let Some(tcp) = stack.tcp_stream_map.get(network_tuple) {
             Some(SenderBox::Mpsc(tcp.value().clone()))
         } else if let Some(tcp) = stack.tcp_listener_map.get(&network_tuple.dst) {
             Some(SenderBox::Mpsc(tcp.value().clone()))
@@ -348,7 +350,7 @@ impl IpStackSend {
             }
         }
     }
-    fn get_udp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_udp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(udp) = stack.udp_socket_map.get(&network_tuple.dst) {
             Some(SenderBox::Mpmc(udp.value().clone()))
@@ -364,18 +366,18 @@ impl IpStackSend {
             }
         }
     }
-    fn get_icmp_sender(&mut self, network_tuple: NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_raw_sender(&mut self, protocol: IpNextHeaderProtocol, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
-        if let Some(icmp) = stack.icmp_socket_map.get(&network_tuple.dst) {
-            Some(SenderBox::Mpmc(icmp.value().clone()))
+        if let Some(socket) = stack.raw_socket_map.get(&(protocol, network_tuple.dst)) {
+            Some(SenderBox::Mpmc(socket.value().clone()))
         } else {
             let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
-            if let Some(icmp) = stack.icmp_socket_map.get(&dst) {
-                Some(SenderBox::Mpmc(icmp.value().clone()))
+            if let Some(socket) = stack.raw_socket_map.get(&(protocol, dst)) {
+                Some(SenderBox::Mpmc(socket.value().clone()))
             } else {
                 stack
-                    .icmp_socket_map
-                    .get(&UNSPECIFIED_ADDR)
+                    .raw_socket_map
+                    .get(&(protocol, UNSPECIFIED_ADDR))
                     .map(|icmp| SenderBox::Mpmc(icmp.value().clone()))
             }
         }
@@ -688,8 +690,7 @@ fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
             };
             (udp_packet.get_source(), udp_packet.get_destination())
         }
-        IpNextHeaderProtocols::Icmp => (0, 0),
-        protocol => return Err(io::Error::new(io::ErrorKind::Unsupported, format!("protocol={protocol}"))),
+        _ => (0, 0),
     };
 
     let src_addr = SocketAddrV4::new(src_ip, src_port);
