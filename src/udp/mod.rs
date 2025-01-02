@@ -19,7 +19,7 @@ impl UdpSocket {
     }
     pub async fn bind(ip_stack: IpStack, local_addr: SocketAddr) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
-        ip_stack.add_socket(IpNextHeaderProtocols::Udp, local_addr, packet_sender)?;
+        ip_stack.add_socket(Some(IpNextHeaderProtocols::Udp), local_addr, packet_sender)?;
         Ok(Self {
             ip_stack,
             packet_receiver,
@@ -93,6 +93,6 @@ impl UdpSocket {
 }
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        self.ip_stack.remove_socket(IpNextHeaderProtocols::Udp, &self.local_addr);
+        self.ip_stack.remove_socket(Some(IpNextHeaderProtocols::Udp), &self.local_addr);
     }
 }

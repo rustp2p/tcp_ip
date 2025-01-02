@@ -38,6 +38,9 @@ name = "udp"
 name = "icmp"
 
 [[example]]
+name = "ipv4"
+
+[[example]]
 name = "tcp_proxy"
 
 [[example]]

@@ -87,7 +87,7 @@ pub(crate) struct IpStackInner {
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<SocketAddr, Sender<TransportPacket>>,
     pub(crate) udp_socket_map: DashMap<SocketAddr, flume::Sender<TransportPacket>>,
-    pub(crate) raw_socket_map: DashMap<(IpNextHeaderProtocol, SocketAddr), flume::Sender<TransportPacket>>,
+    pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, SocketAddr), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
 }
 
@@ -248,12 +248,12 @@ impl IpStack {
     }
     pub(crate) fn add_socket(
         &self,
-        protocol: IpNextHeaderProtocol,
+        protocol: Option<IpNextHeaderProtocol>,
         local_addr: SocketAddr,
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
         match protocol {
-            IpNextHeaderProtocols::Udp => Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender),
+            Some(IpNextHeaderProtocols::Udp) => Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender),
             protocol => Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender),
         }
     }
@@ -269,9 +269,9 @@ impl IpStack {
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
         self.inner.tcp_stream_map.remove(network_tuple);
     }
-    pub(crate) fn remove_socket(&self, protocol: IpNextHeaderProtocol, local_addr: &SocketAddr) {
+    pub(crate) fn remove_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: &SocketAddr) {
         match protocol {
-            IpNextHeaderProtocols::Udp => {
+            Some(IpNextHeaderProtocols::Udp) => {
                 self.inner.udp_socket_map.remove(local_addr);
             }
             protocol => {
@@ -312,11 +312,14 @@ impl IpStackSend {
                 let Some(network_tuple) = self.prepare_ip_fragments(&packet, id_key)? else {
                     return Ok(());
                 };
-                let sender = match packet.get_next_level_protocol() {
+                let mut sender = match packet.get_next_level_protocol() {
                     IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
                     IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
-                    protocol => self.get_raw_sender(protocol, &network_tuple),
+                    _ => None,
                 };
+                if sender.is_none() {
+                    sender = self.get_raw_sender(packet.get_next_level_protocol(), &network_tuple);
+                }
                 if let Some(sender) = sender {
                     let rs = self.transmit_ip_packet(sender, packet, id_key, network_tuple).await;
                     if rs.is_err() {
@@ -367,6 +370,17 @@ impl IpStackSend {
         }
     }
     fn get_raw_sender(&mut self, protocol: IpNextHeaderProtocol, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+        if let Some(v) = self.get_raw_sender0(Some(protocol), network_tuple) {
+            Some(v)
+        } else {
+            self.get_raw_sender0(None, network_tuple)
+        }
+    }
+    fn get_raw_sender0(
+        &mut self,
+        protocol: Option<IpNextHeaderProtocol>,
+        network_tuple: &NetworkTuple,
+    ) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(socket) = stack.raw_socket_map.get(&(protocol, network_tuple.dst)) {
             Some(SenderBox::Mpmc(socket.value().clone()))

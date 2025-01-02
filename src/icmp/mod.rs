@@ -16,7 +16,13 @@ impl IcmpSocket {
         Self::bind(ip_stack, UNSPECIFIED_ADDR.ip()).await
     }
     pub async fn bind(ip_stack: IpStack, local_ip: IpAddr) -> io::Result<Self> {
-        let raw_ip_socket = Ipv4Socket::bind0(ip_stack.config.icmp_channel_size, IpNextHeaderProtocols::Icmp, ip_stack, local_ip).await?;
+        let raw_ip_socket = Ipv4Socket::bind0(
+            ip_stack.config.icmp_channel_size,
+            Some(IpNextHeaderProtocols::Icmp),
+            ip_stack,
+            local_ip,
+        )
+        .await?;
         Ok(Self { raw_ip_socket })
     }
 }
