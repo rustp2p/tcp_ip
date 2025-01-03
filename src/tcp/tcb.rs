@@ -82,7 +82,7 @@ pub struct Tcb {
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
     last_snd_wnd: u16,
-    requires_ack_repeat:bool,
+    requires_ack_repeat: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -609,7 +609,7 @@ impl Tcb {
         } else {
             self.tcp_out_of_order_queue.push(unread_packet);
             self.advice_ack();
-            if !self.tcp_out_of_order_queue.is_empty(){
+            if !self.tcp_out_of_order_queue.is_empty() {
                 // If out-of-order packets are present, a duplicate ACK is required to trigger the peer's fast retransmit.
                 self.requires_ack_repeat = true;
             }
