@@ -71,7 +71,7 @@ pub struct Tcb {
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
-    pub tcp_receive_queue: TcpReceiveQueue,
+    tcp_receive_queue: TcpReceiveQueue,
     tcp_out_of_order_queue: TcpOfoQueue,
     back_seq: Option<SeqNum>,
     inflight_packets: VecDeque<InflightPacket>,
@@ -82,6 +82,7 @@ pub struct Tcb {
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
     last_snd_wnd: u16,
+    requires_ack_repeat:bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
@@ -310,6 +311,7 @@ impl Tcb {
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
             last_snd_wnd: 0,
+            requires_ack_repeat: false,
         }
     }
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
@@ -607,6 +609,10 @@ impl Tcb {
         } else {
             self.tcp_out_of_order_queue.push(unread_packet);
             self.advice_ack();
+            if !self.tcp_out_of_order_queue.is_empty(){
+                // If out-of-order packets are present, a duplicate ACK is required to trigger the peer's fast retransmit.
+                self.requires_ack_repeat = true;
+            }
         }
     }
     fn advice_ack(&mut self) {
@@ -632,7 +638,7 @@ impl Tcb {
         }
     }
     pub fn need_ack(&self) -> bool {
-        self.last_snd_wnd != self.recv_window() || self.snd_ack != self.last_snd_ack
+        self.last_snd_wnd != self.recv_window() || self.snd_ack != self.last_snd_ack || self.requires_ack_repeat
     }
     pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
@@ -674,6 +680,7 @@ impl Tcb {
     pub fn perform_post_ack_action(&mut self) {
         self.last_snd_wnd = self.recv_window();
         self.last_snd_ack = self.snd_ack;
+        self.requires_ack_repeat = false;
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
         let ack = AckNum::from(tcp_packet.get_acknowledgement());
