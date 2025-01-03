@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket, UNSPECIFIED_ADDR};
+use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
 use bytes::BytesMut;
 pub use pnet_packet::ip::IpNextHeaderProtocol;
 pub use pnet_packet::ip::IpNextHeaderProtocols;
@@ -13,23 +13,23 @@ pub struct IpSocket {
     protocol: Option<IpNextHeaderProtocol>,
     ip_stack: IpStack,
     packet_receiver: flume::Receiver<TransportPacket>,
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
 }
 
 impl IpSocket {
     pub async fn bind_all(protocol: Option<IpNextHeaderProtocol>, ip_stack: IpStack) -> io::Result<Self> {
-        Self::bind(protocol, ip_stack, UNSPECIFIED_ADDR.ip()).await
+        Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, None).await
     }
     pub async fn bind(protocol: Option<IpNextHeaderProtocol>, ip_stack: IpStack, local_ip: IpAddr) -> io::Result<Self> {
-        Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, local_ip).await
+        Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, Some(local_ip)).await
     }
     pub(crate) async fn bind0(
         channel_size: usize,
         protocol: Option<IpNextHeaderProtocol>,
         ip_stack: IpStack,
-        local_ip: IpAddr,
+        local_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
-        let local_addr = SocketAddr::new(local_ip, 0);
+        let local_addr = local_ip.map(|ip| SocketAddr::new(ip, 0));
         let (packet_sender, packet_receiver) = flume::bounded(channel_size);
         ip_stack.add_socket(protocol, local_addr, packet_sender)?;
         Ok(Self {
@@ -43,17 +43,18 @@ impl IpSocket {
 
 impl IpSocket {
     pub fn local_ip(&self) -> io::Result<IpAddr> {
-        Ok(self.local_addr.ip())
+        self.local_addr
+            .map(|v| v.ip())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, IpAddr)> {
         let (len, src, _dst) = self.recv_from_to(buf).await?;
         Ok((len, src))
     }
     pub async fn send_to(&self, buf: &[u8], addr: IpAddr) -> io::Result<usize> {
-        let from = self.local_addr;
-        if from == UNSPECIFIED_ADDR {
+        let Some(from) = self.local_addr else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
-        }
+        };
         self.send_from_to(buf, from.ip(), addr).await
     }
     pub async fn recv_from_to(&self, buf: &mut [u8]) -> io::Result<(usize, IpAddr, IpAddr)> {

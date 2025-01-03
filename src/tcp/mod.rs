@@ -1,4 +1,4 @@
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket, UNSPECIFIED_ADDR};
+use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 use bytes::{Buf, BytesMut};
@@ -23,7 +23,7 @@ mod tcp_queue;
 pub struct TcpListener {
     ip_stack: IpStack,
     packet_receiver: Receiver<TransportPacket>,
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     tcb_map: HashMap<NetworkTuple, Tcb>,
 }
 
@@ -47,9 +47,12 @@ pub struct TcpStreamWriteHalf {
 
 impl TcpListener {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
-        Self::bind(ip_stack, UNSPECIFIED_ADDR).await
+        Self::bind0(ip_stack, None).await
     }
     pub async fn bind(ip_stack: IpStack, local_addr: SocketAddr) -> io::Result<Self> {
+        Self::bind0(ip_stack, Some(local_addr)).await
+    }
+    async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
         ip_stack.add_tcp_listener(local_addr, packet_sender)?;
         Ok(Self {

@@ -3,19 +3,34 @@ use dashmap::{DashMap, Entry};
 use parking_lot::Mutex;
 use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
+use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::Packet;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
 use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 
-pub(crate) const UNSPECIFIED_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-
+pub(crate) const UNSPECIFIED_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+pub(crate) const UNSPECIFIED_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+pub(crate) const fn default_addr(is_v4: bool) -> SocketAddr {
+    if is_v4 {
+        UNSPECIFIED_ADDR_V4
+    } else {
+        UNSPECIFIED_ADDR_V6
+    }
+}
+pub(crate) const fn default_ip(is_v4: bool) -> IpAddr {
+    if is_v4 {
+        UNSPECIFIED_ADDR_V4.ip()
+    } else {
+        UNSPECIFIED_ADDR_V6.ip()
+    }
+}
 #[derive(Copy, Clone, Debug)]
 pub struct IpStackConfig {
     pub mtu: u16,
@@ -85,9 +100,9 @@ pub struct IpStack {
 #[derive(Debug)]
 pub(crate) struct IpStackInner {
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
-    pub(crate) tcp_listener_map: DashMap<SocketAddr, Sender<TransportPacket>>,
-    pub(crate) udp_socket_map: DashMap<SocketAddr, flume::Sender<TransportPacket>>,
-    pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, SocketAddr), flume::Sender<TransportPacket>>,
+    pub(crate) tcp_listener_map: DashMap<Option<SocketAddr>, Sender<TransportPacket>>,
+    pub(crate) udp_socket_map: DashMap<Option<SocketAddr>, flume::Sender<TransportPacket>>,
+    pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
 }
 
@@ -156,7 +171,11 @@ pub(crate) struct NetworkTuple {
 
 impl NetworkTuple {
     pub fn new(src: SocketAddr, dst: SocketAddr, protocol: IpNextHeaderProtocol) -> Self {
+        assert_eq!(src.is_ipv4(), dst.is_ipv4());
         Self { src, dst, protocol }
+    }
+    pub fn is_ipv4(&self) -> bool {
+        self.src.is_ipv4()
     }
 }
 
@@ -249,7 +268,7 @@ impl IpStack {
     pub(crate) fn add_socket(
         &self,
         protocol: Option<IpNextHeaderProtocol>,
-        local_addr: SocketAddr,
+        local_addr: Option<SocketAddr>,
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
         match protocol {
@@ -257,10 +276,10 @@ impl IpStack {
             protocol => Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender),
         }
     }
-    pub(crate) fn add_tcp_listener(&self, local_addr: SocketAddr, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
+    pub(crate) fn add_tcp_listener(&self, local_addr: Option<SocketAddr>, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner.tcp_listener_map, local_addr, packet_sender)
     }
-    pub(crate) fn remove_tcp_listener(&self, local_addr: &SocketAddr) {
+    pub(crate) fn remove_tcp_listener(&self, local_addr: &Option<SocketAddr>) {
         self.inner.tcp_listener_map.remove(local_addr);
     }
     pub(crate) fn add_tcp_socket(&self, network_tuple: NetworkTuple, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
@@ -269,7 +288,7 @@ impl IpStack {
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
         self.inner.tcp_stream_map.remove(network_tuple);
     }
-    pub(crate) fn remove_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: &SocketAddr) {
+    pub(crate) fn remove_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: &Option<SocketAddr>) {
         match protocol {
             Some(IpNextHeaderProtocols::Udp) => {
                 self.inner.udp_socket_map.remove(local_addr);
@@ -309,7 +328,7 @@ impl IpStackSend {
 
                 let id_key = convert_id_key(&packet);
 
-                let Some(network_tuple) = self.prepare_ip_fragments(&packet, id_key)? else {
+                let Some(network_tuple) = self.prepare_ipv4_fragments(&packet, id_key)? else {
                     return Ok(());
                 };
                 let mut sender = match packet.get_next_level_protocol() {
@@ -331,7 +350,25 @@ impl IpStackSend {
                     Ok(())
                 }
             }
-            6 => Err(io::Error::new(io::ErrorKind::Unsupported, "ipv6")),
+            6 => {
+                let Some(packet) = Ipv6Packet::new(buf) else {
+                    return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                };
+                // todo Need to handle fragmentation, routing, and other header information.
+                let network_tuple = self.prepare_ipv6_fragments(&packet)?;
+                let mut sender = match packet.get_next_header() {
+                    IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
+                    IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
+                    _ => None,
+                };
+                if sender.is_none() {
+                    sender = self.get_raw_sender(packet.get_next_header(), &network_tuple);
+                }
+                if let Some(sender) = sender {
+                    _ = sender.send(TransportPacket::new(packet.payload().into(), network_tuple)).await;
+                }
+                Ok(())
+            }
             _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
         }
     }
@@ -339,33 +376,31 @@ impl IpStackSend {
         let stack = &self.ip_stack.inner;
         if let Some(tcp) = stack.tcp_stream_map.get(network_tuple) {
             Some(SenderBox::Mpsc(tcp.value().clone()))
-        } else if let Some(tcp) = stack.tcp_listener_map.get(&network_tuple.dst) {
+        } else if let Some(tcp) = stack.tcp_listener_map.get(&Some(network_tuple.dst)) {
             Some(SenderBox::Mpsc(tcp.value().clone()))
         } else {
-            let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
-            if let Some(tcp) = stack.tcp_listener_map.get(&dst) {
+            let dst = SocketAddr::new(default_ip(network_tuple.is_ipv4()), network_tuple.dst.port());
+            if let Some(tcp) = stack.tcp_listener_map.get(&Some(dst)) {
+                Some(SenderBox::Mpsc(tcp.value().clone()))
+            } else if let Some(tcp) = stack.tcp_listener_map.get(&Some(default_addr(network_tuple.is_ipv4()))) {
                 Some(SenderBox::Mpsc(tcp.value().clone()))
             } else {
-                stack
-                    .tcp_listener_map
-                    .get(&UNSPECIFIED_ADDR)
-                    .map(|tcp| SenderBox::Mpsc(tcp.value().clone()))
+                stack.tcp_listener_map.get(&None).map(|tcp| SenderBox::Mpsc(tcp.value().clone()))
             }
         }
     }
     fn get_udp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
-        if let Some(udp) = stack.udp_socket_map.get(&network_tuple.dst) {
+        if let Some(udp) = stack.udp_socket_map.get(&Some(network_tuple.dst)) {
             Some(SenderBox::Mpmc(udp.value().clone()))
         } else {
-            let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
-            if let Some(udp) = stack.udp_socket_map.get(&dst) {
+            let dst = SocketAddr::new(default_ip(network_tuple.is_ipv4()), network_tuple.dst.port());
+            if let Some(udp) = stack.udp_socket_map.get(&Some(dst)) {
+                Some(SenderBox::Mpmc(udp.value().clone()))
+            } else if let Some(udp) = stack.udp_socket_map.get(&Some(default_addr(network_tuple.is_ipv4()))) {
                 Some(SenderBox::Mpmc(udp.value().clone()))
             } else {
-                stack
-                    .udp_socket_map
-                    .get(&UNSPECIFIED_ADDR)
-                    .map(|udp| SenderBox::Mpmc(udp.value().clone()))
+                stack.udp_socket_map.get(&None).map(|udp| SenderBox::Mpmc(udp.value().clone()))
             }
         }
     }
@@ -382,16 +417,18 @@ impl IpStackSend {
         network_tuple: &NetworkTuple,
     ) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
-        if let Some(socket) = stack.raw_socket_map.get(&(protocol, network_tuple.dst)) {
+        if let Some(socket) = stack.raw_socket_map.get(&(protocol, Some(network_tuple.dst))) {
             Some(SenderBox::Mpmc(socket.value().clone()))
         } else {
-            let dst = SocketAddr::new(UNSPECIFIED_ADDR.ip(), network_tuple.dst.port());
-            if let Some(socket) = stack.raw_socket_map.get(&(protocol, dst)) {
+            let dst = SocketAddr::new(default_ip(network_tuple.is_ipv4()), network_tuple.dst.port());
+            if let Some(socket) = stack.raw_socket_map.get(&(protocol, Some(dst))) {
+                Some(SenderBox::Mpmc(socket.value().clone()))
+            } else if let Some(socket) = stack.raw_socket_map.get(&(protocol, Some(default_addr(network_tuple.is_ipv4())))) {
                 Some(SenderBox::Mpmc(socket.value().clone()))
             } else {
                 stack
                     .raw_socket_map
-                    .get(&(protocol, UNSPECIFIED_ADDR))
+                    .get(&(protocol, None))
                     .map(|icmp| SenderBox::Mpmc(icmp.value().clone()))
             }
         }
@@ -422,7 +459,7 @@ impl IpStackSend {
         _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
         Ok(())
     }
-    fn prepare_ip_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
+    fn prepare_ipv4_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
         let offset = ip_packet.get_fragment_offset();
         let network_tuple = if offset == 0
             || (ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Udp
@@ -445,6 +482,19 @@ impl IpStackSend {
             }
         };
         Ok(Some(network_tuple))
+    }
+    fn prepare_ipv6_fragments(&mut self, ip_packet: &Ipv6Packet<'_>) -> io::Result<NetworkTuple> {
+        match ip_packet.get_next_header() {
+            IpNextHeaderProtocols::Ipv6Frag
+            | IpNextHeaderProtocols::Ipv6Route
+            | IpNextHeaderProtocols::Ipv6Opts
+            | IpNextHeaderProtocols::Ipv6NoNxt => {
+                // todo Handle IP fragmentation.
+                return Err(Error::new(io::ErrorKind::Unsupported, "ipv6 option"));
+            }
+            _ => {}
+        }
+        convert_network_tuple_v6(ip_packet)
     }
     fn merge_ip_fragments(
         &mut self,
@@ -533,16 +583,57 @@ impl IpStackRecv {
 }
 impl IpStackRecvInner {
     async fn recv_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize]) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs is empty"));
+        }
+        if bufs.len() != sizes.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs.len!=sizes.len"));
+        }
         if let Some(packet) = self.packet_receiver.recv().await {
-            self.split_ip_packet(bufs, sizes, packet)
+            match (packet.network_tuple.src.is_ipv6(), packet.network_tuple.dst.is_ipv6()) {
+                (true, true) => self.wrap_in_ipv6(bufs, sizes, packet),
+                (false, false) => self.split_ip_packet(bufs, sizes, packet),
+                (_, _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "address error")),
+            }
         } else {
             Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"))
         }
     }
-    fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
-        if bufs.len() != sizes.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs.len!=sizes.len"));
+    fn wrap_in_ipv6<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
+        let buf = bufs[0].as_mut();
+        let total_length = 40 + packet.buf.len();
+        if buf.len() < total_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bufs[0] too short.{total_length}>{:?}", buf.len()),
+            ));
         }
+        let src_ip = match packet.network_tuple.src.ip() {
+            IpAddr::V6(ip) => ip,
+            IpAddr::V4(_) => unimplemented!(),
+        };
+        let dst_ip = match packet.network_tuple.dst.ip() {
+            IpAddr::V6(ip) => ip,
+            IpAddr::V4(_) => unimplemented!(),
+        };
+        // 创建一个可变的IPv6数据包
+        let Some(mut ipv6_packet) = pnet_packet::ipv6::MutableIpv6Packet::new(&mut buf[..total_length]) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "ipv6 data error"));
+        };
+        ipv6_packet.set_version(6);
+        ipv6_packet.set_traffic_class(0);
+        ipv6_packet.set_flow_label(0);
+        ipv6_packet.set_payload_length(packet.buf.len() as u16); // 设置负载长度
+        ipv6_packet.set_next_header(packet.network_tuple.protocol);
+        ipv6_packet.set_hop_limit(64);
+        ipv6_packet.set_source(src_ip);
+        ipv6_packet.set_destination(dst_ip);
+        // 添加负载数据
+        ipv6_packet.set_payload(&packet.buf);
+        sizes[0] = total_length;
+        Ok(1)
+    }
+    fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
         let mtu = self.ip_stack.config.mtu;
         self.identification = self.identification.wrapping_sub(1);
         let identification = self.identification;
@@ -710,6 +801,32 @@ fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
     let src_addr = SocketAddrV4::new(src_ip, src_port);
     let dest_addr = SocketAddrV4::new(dest_ip, dest_port);
     let protocol = packet.get_next_level_protocol();
+    let network_tuple = NetworkTuple::new(src_addr.into(), dest_addr.into(), protocol);
+    Ok(network_tuple)
+}
+fn convert_network_tuple_v6(packet: &Ipv6Packet) -> io::Result<NetworkTuple> {
+    let src_ip = packet.get_source();
+    let dest_ip = packet.get_destination();
+    let protocol = packet.get_next_header();
+
+    let (src_port, dest_port) = match protocol {
+        IpNextHeaderProtocols::Tcp => {
+            let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(packet.payload()) else {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            };
+            (tcp_packet.get_source(), tcp_packet.get_destination())
+        }
+        IpNextHeaderProtocols::Udp => {
+            let Some(udp_packet) = pnet_packet::udp::UdpPacket::new(packet.payload()) else {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            };
+            (udp_packet.get_source(), udp_packet.get_destination())
+        }
+        _ => (0, 0),
+    };
+
+    let src_addr = SocketAddrV6::new(src_ip, src_port, 0, 0);
+    let dest_addr = SocketAddrV6::new(dest_ip, dest_port, 0, 0);
     let network_tuple = NetworkTuple::new(src_addr.into(), dest_addr.into(), protocol);
     Ok(network_tuple)
 }

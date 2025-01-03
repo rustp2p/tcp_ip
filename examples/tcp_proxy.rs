@@ -25,8 +25,10 @@ pub async fn main() -> anyhow::Result<()> {
     let server_addr = args.server_addr;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut config = Configuration::default();
-
-    config.mtu(MTU).address_with_prefix((10, 0, 0, 29), 24).up();
+    config
+        .mtu(MTU)
+        .address_with_prefix_multi(&[("CDCD:910A:2222:5498:8475:1111:3900:2025", 64), ("10.0.0.29", 24)])
+        .up();
     let dev = tun_rs::create_as_async(&config)?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig {

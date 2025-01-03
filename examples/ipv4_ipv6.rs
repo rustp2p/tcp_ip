@@ -1,9 +1,8 @@
 #![allow(unused, unused_variables)]
-use std::sync::Arc;
-
-use packet::{icmp, Builder, Packet as IcmpPacket};
+use pnet_packet::icmp::IcmpTypes;
 use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::Packet;
+use std::sync::Arc;
 use tun_rs::{AsyncDevice, Configuration};
 
 use tcp_ip::icmp::IcmpSocket;
@@ -18,7 +17,10 @@ pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
     let mut config = Configuration::default();
 
-    config.mtu(MTU).address_with_prefix((10, 0, 0, 29), 24).up();
+    config
+        .mtu(MTU)
+        .address_with_prefix_multi(&[("CDCD:910A:2222:5498:8475:1111:3900:2025", 64), ("10.0.0.29", 24)])
+        .up();
     let dev = tun_rs::create_as_async(&config)?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig {
@@ -56,21 +58,17 @@ async fn ip_recv(ip_socket: IpSocket) -> anyhow::Result<()> {
     loop {
         let (len, p, src, dst) = ip_socket.recv_protocol_from_to(&mut buf).await?;
         // The read and write operations of Ipv4Socket do not include the IP header.
-        log::info!("src={src},dst={dst},len={len},buf={:?}", &buf[..len]);
+        log::info!("protocol={p},src={src},dst={dst},len={len},buf={:?}", &buf[..len]);
         match p {
             IpNextHeaderProtocols::Icmp => {
-                if let Ok(packet) = icmp::Packet::new(&buf[..len]) {
-                    if let Ok(packet) = packet.echo() {
-                        let reply = icmp::Builder::default()
-                            .echo()?
-                            .reply()?
-                            .identifier(packet.identifier())?
-                            .sequence(packet.sequence())?
-                            .payload(packet.payload())?
-                            .build()?;
-                        ip_socket
-                            .send_protocol_from_to(&reply, IpNextHeaderProtocols::Icmp, dst, src)
-                            .await?;
+                if let Some(mut packet) = pnet_packet::icmp::MutableIcmpPacket::new(&mut buf[..len]) {
+                    if packet.get_icmp_type() == IcmpTypes::EchoRequest {
+                        log::info!("icmp {packet:?}");
+                        packet.set_icmp_type(IcmpTypes::EchoReply);
+                        let checksum = pnet_packet::icmp::checksum(&packet.to_immutable());
+                        packet.set_checksum(checksum);
+
+                        ip_socket.send_from_to(packet.packet(), dst, src).await?;
                     }
                 }
             }
