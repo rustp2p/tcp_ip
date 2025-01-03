@@ -9,14 +9,14 @@ pub use pnet_packet::ip::IpNextHeaderProtocols;
 /// Internally handles the splitting and reassembly of IP fragmentation.
 /// The read and write operations of Ipv4Socket do not include the IP header.
 /// For reading and writing, only the upper-layer protocol data of IP needs to be considered.
-pub struct Ipv4Socket {
+pub struct IpSocket {
     protocol: Option<IpNextHeaderProtocol>,
     ip_stack: IpStack,
     packet_receiver: flume::Receiver<TransportPacket>,
     local_addr: SocketAddr,
 }
 
-impl Ipv4Socket {
+impl IpSocket {
     pub async fn bind_all(protocol: Option<IpNextHeaderProtocol>, ip_stack: IpStack) -> io::Result<Self> {
         Self::bind(protocol, ip_stack, UNSPECIFIED_ADDR.ip()).await
     }
@@ -41,7 +41,7 @@ impl Ipv4Socket {
     }
 }
 
-impl Ipv4Socket {
+impl IpSocket {
     pub fn local_ip(&self) -> io::Result<IpAddr> {
         Ok(self.local_addr.ip())
     }
@@ -108,7 +108,7 @@ impl Ipv4Socket {
         Ok(buf.len())
     }
 }
-impl Drop for Ipv4Socket {
+impl Drop for IpSocket {
     fn drop(&mut self) {
         self.ip_stack.remove_socket(self.protocol, &self.local_addr);
     }

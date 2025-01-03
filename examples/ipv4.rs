@@ -7,7 +7,7 @@ use pnet_packet::Packet;
 use tun_rs::{AsyncDevice, Configuration};
 
 use tcp_ip::icmp::IcmpSocket;
-use tcp_ip::ip::Ipv4Socket;
+use tcp_ip::ip::IpSocket;
 use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 
 const MTU: u16 = 1420;
@@ -27,7 +27,7 @@ pub async fn main() -> anyhow::Result<()> {
     };
     let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     // None means receiving all protocols.
-    let ip_socket = Ipv4Socket::bind_all(None, ip_stack.clone()).await?;
+    let ip_socket = IpSocket::bind_all(None, ip_stack.clone()).await?;
 
     let h1 = tokio::spawn(async {
         if let Err(e) = ip_recv(ip_socket).await {
@@ -51,7 +51,7 @@ pub async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ip_recv(ip_socket: Ipv4Socket) -> anyhow::Result<()> {
+async fn ip_recv(ip_socket: IpSocket) -> anyhow::Result<()> {
     let mut buf = [0; 65536];
     loop {
         let (len, p, src, dst) = ip_socket.recv_protocol_from_to(&mut buf).await?;

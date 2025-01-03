@@ -4,11 +4,11 @@ use std::ops::Deref;
 
 use pnet_packet::ip::IpNextHeaderProtocols;
 
-use crate::ip::Ipv4Socket;
+use crate::ip::IpSocket;
 use crate::ip_stack::{IpStack, UNSPECIFIED_ADDR};
 
 pub struct IcmpSocket {
-    raw_ip_socket: Ipv4Socket,
+    raw_ip_socket: IpSocket,
 }
 
 impl IcmpSocket {
@@ -16,7 +16,7 @@ impl IcmpSocket {
         Self::bind(ip_stack, UNSPECIFIED_ADDR.ip()).await
     }
     pub async fn bind(ip_stack: IpStack, local_ip: IpAddr) -> io::Result<Self> {
-        let raw_ip_socket = Ipv4Socket::bind0(
+        let raw_ip_socket = IpSocket::bind0(
             ip_stack.config.icmp_channel_size,
             Some(IpNextHeaderProtocols::Icmp),
             ip_stack,
@@ -28,7 +28,7 @@ impl IcmpSocket {
 }
 
 impl Deref for IcmpSocket {
-    type Target = Ipv4Socket;
+    type Target = IpSocket;
 
     fn deref(&self) -> &Self::Target {
         &self.raw_ip_socket
