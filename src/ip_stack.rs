@@ -8,7 +8,6 @@ use pnet_packet::Packet;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
-use std::io::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -311,7 +310,7 @@ impl IpStack {
     pub(crate) async fn send_packet(&self, transport_packet: TransportPacket) -> io::Result<()> {
         match self.inner.packet_sender.send(transport_packet).await {
             Ok(_) => Ok(()),
-            Err(_) => Err(Error::new(io::ErrorKind::WriteZero, "ip stack close")),
+            Err(_) => Err(io::Error::new(io::ErrorKind::WriteZero, "ip stack close")),
         }
     }
 }
@@ -490,7 +489,7 @@ impl IpStackSend {
             | IpNextHeaderProtocols::Ipv6Opts
             | IpNextHeaderProtocols::Ipv6NoNxt => {
                 // todo Handle IP fragmentation.
-                return Err(Error::new(io::ErrorKind::Unsupported, "ipv6 option"));
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "ipv6 option"));
             }
             _ => {}
         }
@@ -554,7 +553,7 @@ impl IpStackRecv {
                 let index = self.index;
                 let len = self.sizes[index];
                 if buf.len() < len {
-                    return Err(Error::new(io::ErrorKind::InvalidInput, "bufs too short"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs too short"));
                 }
                 buf[..len].copy_from_slice(&self.bufs[index][..len]);
                 self.index += 1;
@@ -572,7 +571,7 @@ impl IpStackRecv {
             }
             self.num = self.inner.recv_ip_packet(&mut self.bufs, &mut self.sizes).await?;
             if self.num == 0 {
-                return Err(Error::new(io::ErrorKind::UnexpectedEof, "read 0"));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read 0"));
             }
         }
     }

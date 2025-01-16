@@ -114,6 +114,9 @@ impl TcpListener {
 
 impl TcpStream {
     pub async fn connect(ip_stack: IpStack, src: SocketAddr, dest: SocketAddr) -> io::Result<Self> {
+        if src.is_ipv4() != dest.is_ipv4() {
+            return Err(Error::new(io::ErrorKind::InvalidInput, "address error"));
+        }
         Self::connect0(ip_stack, src, dest).await
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {

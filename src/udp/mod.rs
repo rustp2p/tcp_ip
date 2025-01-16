@@ -81,7 +81,7 @@ impl UdpSocket {
                 pnet_packet::util::ipv6_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
             }
             (_, _) => {
-                unreachable!()
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
             }
         };
 

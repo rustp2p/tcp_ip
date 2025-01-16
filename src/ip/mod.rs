@@ -96,6 +96,9 @@ impl IpSocket {
         if buf.len() > u16::MAX as usize - 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "buf too long"));
         }
+        if src.is_ipv4() != dst.is_ipv4() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
+        }
 
         let data: BytesMut = buf.into();
         let src = SocketAddr::new(src, 0);
