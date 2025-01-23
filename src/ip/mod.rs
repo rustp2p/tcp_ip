@@ -31,7 +31,7 @@ impl IpSocket {
     ) -> io::Result<Self> {
         let local_addr = local_ip.map(|ip| SocketAddr::new(ip, 0));
         let (packet_sender, packet_receiver) = flume::bounded(channel_size);
-        ip_stack.add_socket(protocol, local_addr, packet_sender)?;
+        ip_stack.add_ip_socket(protocol, local_addr, packet_sender)?;
         Ok(Self {
             protocol,
             ip_stack,
@@ -114,6 +114,6 @@ impl IpSocket {
 }
 impl Drop for IpSocket {
     fn drop(&mut self) {
-        self.ip_stack.remove_socket(self.protocol, &self.local_addr);
+        self.ip_stack.remove_ip_socket(self.protocol, self.local_addr);
     }
 }

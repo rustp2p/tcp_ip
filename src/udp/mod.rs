@@ -7,26 +7,49 @@ use pnet_packet::Packet;
 
 use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
 
+/// A UDP socket.
+///
+/// UDP is "connectionless", unlike TCP. Meaning, regardless of what address you've bound to, a `UdpSocket`
+/// is free to communicate with many different remotes. In tcp_ip there are basically two main ways to use `UdpSocket`:
+///
+/// * one to many: [`bind`](`UdpSocket::bind`) and use [`send_to`](`UdpSocket::send_to`)
+///   and [`recv_from`](`UdpSocket::recv_from`) to communicate with many different addresses
+/// * many to many: [`bind_all`](`UdpSocket::bind_all`) and use [`send_from_to`](`UdpSocket::send_from_to`)
+///   and [`recv_from_to`](`UdpSocket::recv_from_to`) to communicate with many different addresses
+/// * one to one: [`connect`](`UdpSocket::connect`) and associate with a single address, using [`send`](`UdpSocket::send`)
+///   and [`recv`](`UdpSocket::recv`) to communicate only with that remote address
+///
+/// This type does not provide a `split` method, because this functionality
+/// can be achieved by instead wrapping the socket in an [`Arc`]. Note that
+/// you do not need a `Mutex` to share the `UdpSocket` — an `Arc<UdpSocket>`
+/// is enough. This is because all of the methods take `&self` instead of
+/// `&mut self`. Once you have wrapped it in an `Arc`, you can call
+/// `.clone()` on the `Arc<UdpSocket>` to get multiple shared handles to the
+/// same socket.
+///
+/// [`Arc`]: std::sync::Arc
 pub struct UdpSocket {
     ip_stack: IpStack,
     packet_receiver: flume::Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
 }
 
 impl UdpSocket {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
-        Self::bind0(ip_stack, None).await
+        Self::bind0(ip_stack, None, None).await
     }
     pub async fn bind(ip_stack: IpStack, local_addr: SocketAddr) -> io::Result<Self> {
-        Self::bind0(ip_stack, Some(local_addr)).await
+        Self::bind0(ip_stack, Some(local_addr), None).await
     }
-    async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>) -> io::Result<Self> {
+    async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
-        ip_stack.add_socket(Some(IpNextHeaderProtocols::Udp), local_addr, packet_sender)?;
+        ip_stack.add_udp_socket(local_addr, peer_addr, packet_sender)?;
         Ok(Self {
             ip_stack,
             packet_receiver,
             local_addr,
+            peer_addr,
         })
     }
 }
@@ -93,8 +116,26 @@ impl UdpSocket {
         Ok(buf.len())
     }
 }
+impl UdpSocket {
+    pub async fn connect(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
+        Self::bind0(ip_stack, Some(local_addr), Some(peer_addr)).await
+    }
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let Some(from) = self.local_addr else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
+        };
+        let Some(to) = self.peer_addr else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify destination address"));
+        };
+        self.send_from_to(buf, from, to).await
+    }
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let (len, _src, _dst) = self.recv_from_to(buf).await?;
+        Ok(len)
+    }
+}
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        self.ip_stack.remove_socket(Some(IpNextHeaderProtocols::Udp), &self.local_addr);
+        self.ip_stack.remove_udp_socket(self.local_addr, self.peer_addr);
     }
 }

@@ -20,6 +20,30 @@ mod sys;
 mod tcb;
 mod tcp_queue;
 
+/// A TCP socket server, listening for connections.
+/// You can accept a new connection by using the accept method.
+/// # Example
+///  ```no_run
+/// use std::io;
+///
+/// async fn process_socket<T>(socket: T) {
+///     // do work with socket here
+/// }
+///
+/// #[tokio::main]
+/// async fn main() -> io::Result<()> {
+///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///             tcp_ip::ip_stack(tcp_ip::ip_stack::IpStackConfig::default())?;
+///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///     let src = "10.0.0.2:8080".parse().unwrap();
+///     let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
+///
+///     loop {
+///         let (socket, _) = listener.accept().await?;
+///         process_socket(socket).await;
+///     }
+/// }
+/// ```
 pub struct TcpListener {
     ip_stack: IpStack,
     packet_receiver: Receiver<TransportPacket>,
@@ -27,6 +51,27 @@ pub struct TcpListener {
     tcb_map: HashMap<NetworkTuple, Tcb>,
 }
 
+/// A TCP stream between a local and a remote socket.
+///
+/// # Example
+/// ```no_run
+/// #[tokio::main]
+/// async fn main() -> std::io::Result<()> {
+///     // Connect to a peer
+///     use tokio::io::AsyncWriteExt;
+///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///             tcp_ip::ip_stack(tcp_ip::ip_stack::IpStackConfig::default())?;
+///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///     let src = "10.0.0.2:8080".parse().unwrap();
+///     let dst = "10.0.0.3:8080".parse().unwrap();
+///     let mut stream = tcp_ip::tcp::TcpStream::connect(ip_stack.clone(),src,dst).await?;
+///
+///     // Write some data.
+///     stream.write_all(b"hello world!").await?;
+///
+///     Ok(())
+/// }
+/// ```
 pub struct TcpStream {
     local_addr: SocketAddr,
     peer_addr: SocketAddr,

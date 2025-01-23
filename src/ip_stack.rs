@@ -30,6 +30,7 @@ pub(crate) const fn default_ip(is_v4: bool) -> IpAddr {
         UNSPECIFIED_ADDR_V6.ip()
     }
 }
+/// Configure the protocol stack
 #[derive(Copy, Clone, Debug)]
 pub struct IpStackConfig {
     pub mtu: u16,
@@ -90,6 +91,7 @@ impl Default for IpStackConfig {
     }
 }
 
+/// Context information of protocol stack
 #[derive(Clone, Debug)]
 pub struct IpStack {
     pub(crate) config: IpStackConfig,
@@ -100,11 +102,12 @@ pub struct IpStack {
 pub(crate) struct IpStackInner {
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<Option<SocketAddr>, Sender<TransportPacket>>,
-    pub(crate) udp_socket_map: DashMap<Option<SocketAddr>, flume::Sender<TransportPacket>>,
+    pub(crate) udp_socket_map: DashMap<(Option<SocketAddr>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
 }
 
+/// Send IP packets to the protocol stack using `IpStackSend`
 pub struct IpStackSend {
     ip_stack: IpStack,
     ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>,
@@ -127,6 +130,7 @@ impl IpStackSend {
     }
 }
 
+/// Receive IP packets from the protocol stack using `IpStackRecv`
 pub struct IpStackRecv {
     inner: IpStackRecvInner,
     index: usize,
@@ -264,16 +268,21 @@ impl IpStack {
             }),
         }
     }
-    pub(crate) fn add_socket(
+    pub(crate) fn add_ip_socket(
         &self,
         protocol: Option<IpNextHeaderProtocol>,
         local_addr: Option<SocketAddr>,
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
-        match protocol {
-            Some(IpNextHeaderProtocols::Udp) => Self::add_socket0(&self.inner.udp_socket_map, local_addr, packet_sender),
-            protocol => Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender),
-        }
+        Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender)
+    }
+    pub(crate) fn add_udp_socket(
+        &self,
+        local_addr: Option<SocketAddr>,
+        peer_addr: Option<SocketAddr>,
+        packet_sender: flume::Sender<TransportPacket>,
+    ) -> io::Result<()> {
+        Self::add_socket0(&self.inner.udp_socket_map, (local_addr, peer_addr), packet_sender)
     }
     pub(crate) fn add_tcp_listener(&self, local_addr: Option<SocketAddr>, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner.tcp_listener_map, local_addr, packet_sender)
@@ -287,15 +296,11 @@ impl IpStack {
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
         self.inner.tcp_stream_map.remove(network_tuple);
     }
-    pub(crate) fn remove_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: &Option<SocketAddr>) {
-        match protocol {
-            Some(IpNextHeaderProtocols::Udp) => {
-                self.inner.udp_socket_map.remove(local_addr);
-            }
-            protocol => {
-                self.inner.raw_socket_map.remove(&(protocol, *local_addr));
-            }
-        }
+    pub(crate) fn remove_udp_socket(&self, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) {
+        self.inner.udp_socket_map.remove(&(local_addr, peer_addr));
+    }
+    pub(crate) fn remove_ip_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: Option<SocketAddr>) {
+        self.inner.raw_socket_map.remove(&(protocol, local_addr));
     }
     fn add_socket0<K: Eq + PartialEq + Hash, V>(map: &DashMap<K, V>, local_addr: K, packet_sender: V) -> io::Result<()> {
         let entry = map.entry(local_addr);
@@ -390,16 +395,22 @@ impl IpStackSend {
     }
     fn get_udp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
-        if let Some(udp) = stack.udp_socket_map.get(&Some(network_tuple.dst)) {
+        if let Some(udp) = stack.udp_socket_map.get(&(Some(network_tuple.dst), Some(network_tuple.src))) {
+            return Some(SenderBox::Mpmc(udp.value().clone()));
+        }
+        if let Some(udp) = stack.udp_socket_map.get(&(Some(network_tuple.dst), None)) {
             Some(SenderBox::Mpmc(udp.value().clone()))
         } else {
             let dst = SocketAddr::new(default_ip(network_tuple.is_ipv4()), network_tuple.dst.port());
-            if let Some(udp) = stack.udp_socket_map.get(&Some(dst)) {
+            if let Some(udp) = stack.udp_socket_map.get(&(Some(dst), None)) {
                 Some(SenderBox::Mpmc(udp.value().clone()))
-            } else if let Some(udp) = stack.udp_socket_map.get(&Some(default_addr(network_tuple.is_ipv4()))) {
+            } else if let Some(udp) = stack.udp_socket_map.get(&(Some(default_addr(network_tuple.is_ipv4())), None)) {
                 Some(SenderBox::Mpmc(udp.value().clone()))
             } else {
-                stack.udp_socket_map.get(&None).map(|udp| SenderBox::Mpmc(udp.value().clone()))
+                stack
+                    .udp_socket_map
+                    .get(&(None, None))
+                    .map(|udp| SenderBox::Mpmc(udp.value().clone()))
             }
         }
     }
