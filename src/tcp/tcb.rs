@@ -283,7 +283,7 @@ impl TcpConfig {
 /// Implementation related to initialization connection
 impl Tcb {
     pub fn new_listen(local_addr: SocketAddr, peer_addr: SocketAddr, config: TcpConfig) -> Self {
-        let snd_seq = SeqNum::from(rand::thread_rng().next_u32());
+        let snd_seq = SeqNum::from(rand::rng().next_u32());
         Self {
             state: TcpState::Listen,
             local_addr,
