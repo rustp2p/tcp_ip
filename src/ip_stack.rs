@@ -108,6 +108,7 @@ pub(crate) struct IpStackInner {
 }
 
 /// Send IP packets to the protocol stack using `IpStackSend`
+#[derive(Clone)]
 pub struct IpStackSend {
     ip_stack: IpStack,
     ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>,
@@ -322,7 +323,7 @@ impl IpStack {
 
 impl IpStackSend {
     /// Send the IP packet to this protocol stack.
-    pub async fn send_ip_packet(&mut self, buf: &[u8]) -> io::Result<()> {
+    pub async fn send_ip_packet(&self, buf: &[u8]) -> io::Result<()> {
         let p = buf[0] >> 4;
         match p {
             4 => {
@@ -376,7 +377,7 @@ impl IpStackSend {
             _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
         }
     }
-    fn get_tcp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_tcp_sender(&self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(tcp) = stack.tcp_stream_map.get(network_tuple) {
             Some(SenderBox::Mpsc(tcp.value().clone()))
@@ -393,7 +394,7 @@ impl IpStackSend {
             }
         }
     }
-    fn get_udp_sender(&mut self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_udp_sender(&self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(udp) = stack.udp_socket_map.get(&(Some(network_tuple.dst), Some(network_tuple.src))) {
             return Some(SenderBox::Mpmc(udp.value().clone()));
@@ -414,7 +415,7 @@ impl IpStackSend {
             }
         }
     }
-    fn get_raw_sender(&mut self, protocol: IpNextHeaderProtocol, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+    fn get_raw_sender(&self, protocol: IpNextHeaderProtocol, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         if let Some(v) = self.get_raw_sender0(Some(protocol), network_tuple) {
             Some(v)
         } else {
@@ -422,7 +423,7 @@ impl IpStackSend {
         }
     }
     fn get_raw_sender0(
-        &mut self,
+        &self,
         protocol: Option<IpNextHeaderProtocol>,
         network_tuple: &NetworkTuple,
     ) -> Option<SenderBox<TransportPacket>> {
@@ -444,7 +445,7 @@ impl IpStackSend {
         }
     }
     async fn transmit_ip_packet(
-        &mut self,
+        &self,
         sender: SenderBox<TransportPacket>,
         packet: Ipv4Packet<'_>,
         id_key: IdKey,
@@ -469,7 +470,7 @@ impl IpStackSend {
         _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
         Ok(())
     }
-    fn prepare_ipv4_fragments(&mut self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
+    fn prepare_ipv4_fragments(&self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
         let offset = ip_packet.get_fragment_offset();
         let network_tuple = if offset == 0
             || (ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Udp
@@ -493,7 +494,7 @@ impl IpStackSend {
         };
         Ok(Some(network_tuple))
     }
-    fn prepare_ipv6_fragments(&mut self, ip_packet: &Ipv6Packet<'_>) -> io::Result<NetworkTuple> {
+    fn prepare_ipv6_fragments(&self, ip_packet: &Ipv6Packet<'_>) -> io::Result<NetworkTuple> {
         match ip_packet.get_next_header() {
             IpNextHeaderProtocols::Ipv6Frag
             | IpNextHeaderProtocols::Ipv6Route
@@ -507,7 +508,7 @@ impl IpStackSend {
         convert_network_tuple_v6(ip_packet)
     }
     fn merge_ip_fragments(
-        &mut self,
+        &self,
         ip_packet: &Ipv4Packet<'_>,
         id_key: IdKey,
         network_tuple: NetworkTuple,
