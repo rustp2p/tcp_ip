@@ -422,11 +422,7 @@ impl IpStackSend {
             self.get_raw_sender0(None, network_tuple)
         }
     }
-    fn get_raw_sender0(
-        &self,
-        protocol: Option<IpNextHeaderProtocol>,
-        network_tuple: &NetworkTuple,
-    ) -> Option<SenderBox<TransportPacket>> {
+    fn get_raw_sender0(&self, protocol: Option<IpNextHeaderProtocol>, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
         if let Some(socket) = stack.raw_socket_map.get(&(protocol, Some(network_tuple.dst))) {
             Some(SenderBox::Mpmc(socket.value().clone()))
@@ -507,12 +503,7 @@ impl IpStackSend {
         }
         convert_network_tuple_v6(ip_packet)
     }
-    fn merge_ip_fragments(
-        &self,
-        ip_packet: &Ipv4Packet<'_>,
-        id_key: IdKey,
-        network_tuple: NetworkTuple,
-    ) -> io::Result<Option<BytesMut>> {
+    fn merge_ip_fragments(&self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey, network_tuple: NetworkTuple) -> io::Result<Option<BytesMut>> {
         let mut map = self.ident_fragments_map.lock();
         let ip_fragments = map
             .entry(id_key)
