@@ -149,6 +149,9 @@ impl TcpStreamTask {
                         let packet = self.tcb.fin_packet();
                         self.send_packet(packet).await?;
                     }
+                    if self.read_half_closed() && self.write_half_closed {
+                        return Ok(());
+                    }
                 }
                 TaskRecvData::ReadNotify => {
                     self.push_application_layer();
@@ -169,7 +172,11 @@ impl TcpStreamTask {
         Ok(())
     }
     fn read_half_closed(&self) -> bool {
-        self.application_layer_sender.is_none()
+        if let Some(v) = self.application_layer_sender.as_ref() {
+            v.is_closed()
+        } else {
+            true
+        }
     }
     pub fn mss(&self) -> u16 {
         self.tcb.mss()
@@ -289,8 +296,9 @@ impl TcpStreamTask {
             } else {
                 self.recv_timeout_at(deadline).await
             }
-        } else if self.only_recv_in() {
-            self.recv_in().await
+        } else if self.write_half_closed {
+            let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config.time_wait_timeout);
+            self.recv_in_timeout_at(timeout_at).await
         } else {
             self.recv().await
         }
@@ -341,16 +349,7 @@ impl TcpStreamTask {
     async fn recv_in_timeout(&mut self, duration: Duration) -> TaskRecvData {
         self.recv_in_timeout_at(Instant::now().add(duration)).await
     }
-    async fn recv_in(&mut self) -> TaskRecvData {
-        tokio::select! {
-            rs=self.packet_receiver.recv()=>{
-                rs.map(|v| TaskRecvData::In(v.buf)).unwrap_or(TaskRecvData::InClose)
-            }
-            _=self.read_notify.notified()=>{
-                TaskRecvData::ReadNotify
-            }
-        }
-    }
+
     fn try_recv_in(&mut self) -> Option<BytesMut> {
         self.packet_receiver.try_recv().map(|v| v.buf).ok()
     }

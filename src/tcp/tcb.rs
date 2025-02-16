@@ -256,7 +256,7 @@ impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
-            time_wait_timeout: Duration::from_secs(120),
+            time_wait_timeout: Duration::from_secs(10),
             mss: None,
             rcv_wnd: u16::MAX,
             // Window size too large can cause packet loss
@@ -525,6 +525,11 @@ impl Tcb {
             self.recv_rst();
             return None;
         }
+        if flags & SYN == SYN {
+            let reply_packet = self.create_transport_packet(RST, &[]);
+            return Some(reply_packet);
+        }
+
         let header_len = packet.get_data_offset() as usize * 4;
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
@@ -780,11 +785,14 @@ impl Tcb {
         self.back_seq.take();
         None
     }
-    fn back_n(&mut self) {
+    fn back_n(&mut self) -> bool {
         if let Some(v) = self.inflight_packets.front() {
             self.back_seq.replace(v.start());
             self.congestion_window.on_loss();
             self.reset_write_timeout();
+            true
+        } else {
+            false
         }
     }
     pub fn decelerate(&self) -> bool {
@@ -815,7 +823,9 @@ impl Tcb {
             self.timeout_wait();
             return;
         }
-        self.back_n();
+        if !self.back_n() {
+            return;
+        }
         if self.timeout_count.0 == self.rcv_ack {
             self.timeout_count.1 += 1;
             if self.timeout_count.1 > 10 {
