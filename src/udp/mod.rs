@@ -1,11 +1,11 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::address::ToSocketAddr;
+use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
 use bytes::{BufMut, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::Packet;
-
-use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
 
 /// A UDP socket.
 ///
@@ -39,8 +39,8 @@ impl UdpSocket {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
         Self::bind0(ip_stack, None, None).await
     }
-    pub async fn bind(ip_stack: IpStack, local_addr: SocketAddr) -> io::Result<Self> {
-        Self::bind0(ip_stack, Some(local_addr), None).await
+    pub async fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
+        Self::bind0(ip_stack, Some(local_addr.to_addr()?), None).await
     }
     async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
@@ -62,7 +62,7 @@ impl UdpSocket {
         let (len, src, _dst) = self.recv_from_to(buf).await?;
         Ok((len, src))
     }
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+    pub async fn send_to<A: ToSocketAddr>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         let Some(from) = self.local_addr else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
         };
@@ -82,7 +82,10 @@ impl UdpSocket {
         buf[..len].copy_from_slice(udp_packet.payload());
         Ok((len, packet.network_tuple.src, packet.network_tuple.dst))
     }
-    pub async fn send_from_to(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<usize> {
+    pub async fn send_from_to<A1: ToSocketAddr, A2: ToSocketAddr>(&self, buf: &[u8], src: A1, dst: A2) -> io::Result<usize> {
+        self.send_from_to0(buf, src.to_addr()?, dst.to_addr()?).await
+    }
+    async fn send_from_to0(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<usize> {
         check_addr(src)?;
         check_addr(dst)?;
         if buf.len() > u16::MAX as usize - 8 {
@@ -119,7 +122,18 @@ impl UdpSocket {
     }
 }
 impl UdpSocket {
-    pub async fn connect(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
+    pub async fn connect(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
+        let Some(local_addr) = self.local_addr else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
+        };
+        check_addr(local_addr)?;
+        check_addr(peer_addr)?;
+        self.ip_stack
+            .replace_udp_socket((self.local_addr, self.peer_addr), (self.local_addr, Some(peer_addr)))?;
+        self.peer_addr = Some(peer_addr);
+        Ok(())
+    }
+    pub async fn connect_from_local(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
         Self::bind0(ip_stack, Some(local_addr), Some(peer_addr)).await
     }
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {

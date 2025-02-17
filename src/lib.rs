@@ -4,7 +4,7 @@
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
-    let (ip_stack, _ip_stack_send, mut ip_stack_recv) = tcp_ip::ip_stack(tcp_ip::ip_stack::IpStackConfig::default())?;
+    let (ip_stack, _ip_stack_send, mut ip_stack_recv) = tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
     tokio::spawn(async move {
         loop {
             // ip_stack_send.send_ip_packet()
@@ -38,9 +38,9 @@ pub async fn main() -> std::io::Result<()> {
 
 mod buffer;
 pub mod icmp;
-pub mod ip_stack;
-// Create a user-space protocol stack.
-pub use ip_stack::ip_stack;
+mod ip_stack;
+pub use ip_stack::*;
+pub mod address;
 pub mod ip;
 pub mod tcp;
 pub mod udp;

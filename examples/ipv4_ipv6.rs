@@ -7,7 +7,7 @@ use tun_rs::{AsyncDevice, Configuration};
 
 use tcp_ip::icmp::IcmpSocket;
 use tcp_ip::ip::IpSocket;
-use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
+use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 
 const MTU: u16 = 1420;
 

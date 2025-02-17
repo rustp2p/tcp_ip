@@ -301,6 +301,22 @@ impl IpStack {
     ) -> io::Result<()> {
         Self::add_socket0(&self.inner.udp_socket_map, (local_addr, peer_addr), packet_sender)
     }
+
+    pub(crate) fn replace_udp_socket(
+        &self,
+        old: (Option<SocketAddr>, Option<SocketAddr>),
+        new: (Option<SocketAddr>, Option<SocketAddr>),
+    ) -> io::Result<()> {
+        let packet_sender = if let Some(v) = self.inner.udp_socket_map.get(&old) {
+            v.value().clone()
+        } else {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        };
+        Self::add_socket0(&self.inner.udp_socket_map, new, packet_sender)?;
+        _ = self.inner.udp_socket_map.remove(&old);
+        Ok(())
+    }
+
     pub(crate) fn add_tcp_listener(&self, local_addr: Option<SocketAddr>, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner.tcp_listener_map, local_addr, packet_sender)
     }

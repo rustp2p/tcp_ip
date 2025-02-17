@@ -6,8 +6,8 @@ use pnet_packet::Packet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun_rs::{AsyncDevice, Configuration};
 
-use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 use tcp_ip::tcp::TcpListener;
+use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 
 const MTU: u16 = 1420;
 

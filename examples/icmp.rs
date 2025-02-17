@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tcp_ip::icmp::{IcmpSocket, IcmpV6Socket};
 use tcp_ip::ip::IpSocket;
-use tcp_ip::ip_stack::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
+use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 use tun_rs::{AsyncDevice, Configuration};
 
 const MTU: u16 = 1420;

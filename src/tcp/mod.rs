@@ -12,11 +12,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
-pub use tcb::TcpConfig;
-
+use crate::address::ToSocketAddr;
 use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
+pub use tcb::TcpConfig;
 
 mod sys;
 mod tcb;
@@ -98,8 +98,8 @@ impl TcpListener {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
         Self::bind0(ip_stack, None).await
     }
-    pub async fn bind(ip_stack: IpStack, local_addr: SocketAddr) -> io::Result<Self> {
-        Self::bind0(ip_stack, Some(local_addr)).await
+    pub async fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
+        Self::bind0(ip_stack, Some(local_addr.to_addr()?)).await
     }
     async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
@@ -162,11 +162,13 @@ impl TcpListener {
 }
 
 impl TcpStream {
-    pub fn bind(ip_stack: IpStack, src: SocketAddr) -> io::Result<Self> {
+    pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, src: A) -> io::Result<Self> {
+        let src = src.to_addr()?;
         check_addr(src)?;
         Ok(Self::new_uncheck(Some(ip_stack), src, None, None, None))
     }
-    pub async fn connect(self, dest: SocketAddr) -> io::Result<Self> {
+    pub async fn connect<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
+        let dest = dest.to_addr()?;
         check_addr(dest)?;
         let Some(ip_stack) = self.ip_stack else {
             return Err(Error::new(io::ErrorKind::NotFound, "not bind"));
