@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_ip, IpStack, NetworkTuple, TransportPacket};
 use bytes::BytesMut;
 pub use pnet_packet::ip::IpNextHeaderProtocol;
 pub use pnet_packet::ip::IpNextHeaderProtocols;
@@ -99,6 +99,8 @@ impl IpSocket {
         if src.is_ipv4() != dst.is_ipv4() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
         }
+        check_ip(src)?;
+        check_ip(dst)?;
 
         let data: BytesMut = buf.into();
         let src = SocketAddr::new(src, 0);

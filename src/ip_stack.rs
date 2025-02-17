@@ -30,6 +30,22 @@ pub(crate) const fn default_ip(is_v4: bool) -> IpAddr {
         UNSPECIFIED_ADDR_V6.ip()
     }
 }
+pub(crate) fn check_addr(addr: SocketAddr) -> io::Result<()> {
+    if addr.port() == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port"));
+    }
+    check_ip(addr.ip())
+}
+pub(crate) fn check_ip(ip: IpAddr) -> io::Result<()> {
+    if match ip {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => ip.is_unspecified(),
+    } {
+        Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ip"))
+    } else {
+        Ok(())
+    }
+}
 /// Configure the protocol stack
 #[derive(Copy, Clone, Debug)]
 pub struct IpStackConfig {

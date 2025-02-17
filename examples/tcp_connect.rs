@@ -71,7 +71,9 @@ pub async fn main() -> anyhow::Result<()> {
     });
     let peer_addr = SocketAddrV4::new(local_ip, 18888);
     log::info!("tcp_ip_stream connecting. addr:{peer_addr}");
-    let mut tcp_ip_stream = tcp_ip::tcp::TcpStream::connect(ip_stack.clone(), "10.0.0.2:18889".parse().unwrap(), peer_addr.into()).await?;
+    let mut tcp_ip_stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(), "10.0.0.2:18889".parse().unwrap())?
+        .connect(peer_addr.into())
+        .await?;
     log::info!("tcp_ip_stream connection successful. addr:{peer_addr}");
     tcp_ip_stream.write_all(b"hi").await?;
     let mut buf = [0; 1024];

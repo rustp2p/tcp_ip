@@ -5,7 +5,7 @@ use bytes::{BufMut, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::Packet;
 
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
 
 /// A UDP socket.
 ///
@@ -83,6 +83,8 @@ impl UdpSocket {
         Ok((len, packet.network_tuple.src, packet.network_tuple.dst))
     }
     pub async fn send_from_to(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<usize> {
+        check_addr(src)?;
+        check_addr(dst)?;
         if buf.len() > u16::MAX as usize - 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "buf too long"));
         }

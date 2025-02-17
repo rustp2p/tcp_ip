@@ -1,20 +1,22 @@
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
-use crate::tcp::sys::{ReadNotify, TcpStreamTask};
-use crate::tcp::tcb::Tcb;
-use bytes::{Buf, BytesMut};
-use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::tcp::TcpFlags::{ACK, RST, SYN};
 use std::collections::HashMap;
 use std::io;
 use std::io::Error;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+use bytes::{Buf, BytesMut};
+use pnet_packet::ip::IpNextHeaderProtocols;
+use pnet_packet::tcp::TcpFlags::{ACK, RST, SYN};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
 pub use tcb::TcpConfig;
+
+use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
+use crate::tcp::sys::{ReadNotify, TcpStreamTask};
+use crate::tcp::tcb::Tcb;
 
 mod sys;
 mod tcb;
@@ -64,7 +66,8 @@ pub struct TcpListener {
 ///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
 ///     let src = "10.0.0.2:8080".parse().unwrap();
 ///     let dst = "10.0.0.3:8080".parse().unwrap();
-///     let mut stream = tcp_ip::tcp::TcpStream::connect(ip_stack.clone(),src,dst).await?;
+///     let mut stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(),src)?
+///             .connect(dst).await?;
 ///
 ///     // Write some data.
 ///     stream.write_all(b"hello world!").await?;
@@ -73,10 +76,11 @@ pub struct TcpListener {
 /// }
 /// ```
 pub struct TcpStream {
+    ip_stack: Option<IpStack>,
     local_addr: SocketAddr,
-    peer_addr: SocketAddr,
-    read: TcpStreamReadHalf,
-    write: TcpStreamWriteHalf,
+    peer_addr: Option<SocketAddr>,
+    read: Option<TcpStreamReadHalf>,
+    write: Option<TcpStreamWriteHalf>,
 }
 
 pub struct TcpStreamReadHalf {
@@ -158,7 +162,16 @@ impl TcpListener {
 }
 
 impl TcpStream {
-    pub async fn connect(ip_stack: IpStack, src: SocketAddr, dest: SocketAddr) -> io::Result<Self> {
+    pub fn bind(ip_stack: IpStack, src: SocketAddr) -> io::Result<Self> {
+        check_addr(src)?;
+        Ok(Self::new_uncheck(Some(ip_stack), src, None, None, None))
+    }
+    pub async fn connect(self, dest: SocketAddr) -> io::Result<Self> {
+        check_addr(dest)?;
+        let Some(ip_stack) = self.ip_stack else {
+            return Err(Error::new(io::ErrorKind::NotFound, "not bind"));
+        };
+        let src = self.local_addr;
         if src.is_ipv4() != dest.is_ipv4() {
             return Err(Error::new(io::ErrorKind::InvalidInput, "address error"));
         }
@@ -168,14 +181,35 @@ impl TcpStream {
         Ok(self.local_addr)
     }
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.peer_addr)
+        if let Some(v) = self.peer_addr {
+            Ok(v)
+        } else {
+            Err(Error::from(io::ErrorKind::NotConnected))
+        }
     }
-    pub fn split(self) -> (TcpStreamWriteHalf, TcpStreamReadHalf) {
-        (self.write, self.read)
+    pub fn split(self) -> io::Result<(TcpStreamWriteHalf, TcpStreamReadHalf)> {
+        match (self.write, self.read) {
+            (Some(write), Some(read)) => Ok((write, read)),
+            _ => Err(Error::from(io::ErrorKind::NotConnected)),
+        }
     }
 }
 
 impl TcpStream {
+    fn as_mut_read(&mut self) -> io::Result<&mut TcpStreamReadHalf> {
+        if let Some(v) = self.read.as_mut() {
+            Ok(v)
+        } else {
+            Err(Error::from(io::ErrorKind::NotConnected))
+        }
+    }
+    fn as_mut_write(&mut self) -> io::Result<&mut TcpStreamWriteHalf> {
+        if let Some(v) = self.write.as_mut() {
+            Ok(v)
+        } else {
+            Err(Error::from(io::ErrorKind::NotConnected))
+        }
+    }
     pub(crate) async fn connect0(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
         let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
         let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size);
@@ -205,13 +239,23 @@ impl TcpStream {
             mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
-        let stream = Self {
+        let stream = Self::new_uncheck(None, local_addr, Some(peer_addr), Some(read), Some(write));
+        Ok(stream)
+    }
+    fn new_uncheck(
+        ip_stack: Option<IpStack>,
+        local_addr: SocketAddr,
+        peer_addr: Option<SocketAddr>,
+        read: Option<TcpStreamReadHalf>,
+        write: Option<TcpStreamWriteHalf>,
+    ) -> Self {
+        Self {
+            ip_stack,
             local_addr,
             peer_addr,
             read,
             write,
-        };
-        Ok(stream)
+        }
     }
     pub(crate) fn new0(ip_stack: IpStack, tcb: Tcb) -> io::Result<(Self, TcpStreamTask)> {
         let peer_addr = tcb.peer_addr();
@@ -233,12 +277,7 @@ impl TcpStream {
             mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
-        let stream = Self {
-            local_addr,
-            peer_addr,
-            read,
-            write,
-        };
+        let stream = Self::new_uncheck(None, local_addr, Some(peer_addr), Some(read), Some(write));
         Ok((stream, stream_task))
     }
     pub(crate) fn new(ip_stack: IpStack, tcb: Tcb) -> io::Result<Self> {
@@ -256,7 +295,7 @@ impl TcpStream {
 
 impl AsyncRead for TcpStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.read).poll_read(cx, buf)
+        Pin::new(self.as_mut_read()?).poll_read(cx, buf)
     }
 }
 
@@ -323,15 +362,15 @@ impl TcpStreamReadHalf {
 
 impl AsyncWrite for TcpStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-        Pin::new(&mut self.write).poll_write(cx, buf)
+        Pin::new(self.as_mut_write()?).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.write).poll_flush(cx)
+        Pin::new(self.as_mut_write()?).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.write).poll_shutdown(cx)
+        Pin::new(self.as_mut_write()?).poll_shutdown(cx)
     }
 }
 

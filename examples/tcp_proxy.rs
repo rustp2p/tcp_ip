@@ -51,7 +51,7 @@ pub async fn main() -> anyhow::Result<()> {
             let server_stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
 
             tokio::spawn(async move {
-                let (mut client_write, mut client_read) = tcp_stream.split();
+                let (mut client_write, mut client_read) = tcp_stream.split().unwrap();
                 let (mut server_read, mut server_write) = server_stream.into_split();
                 let h1 = tokio::io::copy(&mut client_read, &mut server_write);
                 let h2 = tokio::io::copy(&mut server_read, &mut client_write);
