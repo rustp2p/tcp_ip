@@ -94,7 +94,7 @@ impl Default for IpStackConfig {
 /// Context information of protocol stack
 #[derive(Clone, Debug)]
 pub struct IpStack {
-    pub(crate) config: IpStackConfig,
+    pub(crate) config: Box<IpStackConfig>,
     pub(crate) inner: Arc<IpStackInner>,
 }
 
@@ -259,7 +259,7 @@ fn check_timeouts(ident_fragments_map: &Mutex<HashMap<IdKey, IpFragments>>, time
 impl IpStack {
     pub(crate) fn new(config: IpStackConfig, packet_sender: Sender<TransportPacket>) -> Self {
         Self {
-            config,
+            config: Box::new(config),
             inner: Arc::new(IpStackInner {
                 tcp_stream_map: Default::default(),
                 tcp_listener_map: Default::default(),
