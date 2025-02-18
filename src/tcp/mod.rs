@@ -35,7 +35,7 @@ mod tcp_queue;
 /// #[tokio::main]
 /// async fn main() -> io::Result<()> {
 ///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::ip_stack::IpStackConfig::default())?;
+///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
 ///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
 ///     let src = "10.0.0.2:8080".parse().unwrap();
 ///     let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
@@ -62,7 +62,7 @@ pub struct TcpListener {
 ///     // Connect to a peer
 ///     use tokio::io::AsyncWriteExt;
 ///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::ip_stack::IpStackConfig::default())?;
+///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
 ///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
 ///     let src = "10.0.0.2:8080".parse().unwrap();
 ///     let dst = "10.0.0.3:8080".parse().unwrap();
@@ -123,6 +123,8 @@ impl TcpListener {
                 let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(&packet.buf) else {
                     return Err(Error::new(io::ErrorKind::InvalidInput, "not tcp"));
                 };
+                let acknowledgement = tcp_packet.get_acknowledgement();
+                let sequence = tcp_packet.get_sequence();
                 let local_addr = network_tuple.dst;
                 let peer_addr = network_tuple.src;
                 if tcp_packet.get_flags() & SYN == SYN {
@@ -132,6 +134,7 @@ impl TcpListener {
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
                         self.ip_stack.send_packet(relay_packet).await?;
                         self.tcb_map.insert(*network_tuple, tcb);
+                        continue;
                     }
                 } else if let Some(tcb) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
@@ -142,18 +145,19 @@ impl TcpListener {
                     if tcb.is_close() {
                         self.tcb_map.remove(network_tuple).unwrap();
                     }
-                } else if tcp_packet.get_flags() & RST != RST {
-                    let data = tcb::create_transport_packet_raw(
-                        &local_addr,
-                        &peer_addr,
-                        tcp_packet.get_acknowledgement(),
-                        tcp_packet.get_sequence().wrapping_add(1),
-                        0,
-                        RST | ACK,
-                        &[],
-                    );
-                    self.ip_stack.send_packet(data).await?;
+                } else if tcp_packet.get_flags() & RST == RST {
+                    continue;
                 }
+                let data = tcb::create_transport_packet_raw(
+                    &local_addr,
+                    &peer_addr,
+                    acknowledgement,
+                    sequence.wrapping_add(1),
+                    0,
+                    RST | ACK,
+                    &[],
+                );
+                self.ip_stack.send_packet(data).await?;
             } else {
                 return Err(Error::from(io::ErrorKind::UnexpectedEof));
             }
@@ -339,6 +343,12 @@ impl AsyncRead for TcpStreamReadHalf {
     }
 }
 
+impl Drop for TcpStreamReadHalf {
+    fn drop(&mut self) {
+        self.payload_receiver.close();
+        self.read_notify.close();
+    }
+}
 impl TcpStreamReadHalf {
     fn try_read0(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         let mut rs = false;

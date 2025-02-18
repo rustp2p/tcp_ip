@@ -250,6 +250,7 @@ pub struct TcpConfig {
     pub mss: Option<u16>,
     pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
+    pub quick_end: bool,
 }
 
 impl Default for TcpConfig {
@@ -261,6 +262,8 @@ impl Default for TcpConfig {
             rcv_wnd: u16::MAX,
             // Window size too large can cause packet loss
             window_shift_cnt: 2,
+            // If the stream is closed, exit the corresponding task immediately
+            quick_end: true,
         }
     }
 }
@@ -377,10 +380,7 @@ impl Tcb {
         false
     }
     pub fn try_syn_sent_to_established(&mut self, buf: BytesMut) -> Option<TransportPacket> {
-        let Some(packet) = TcpPacket::new(&buf) else {
-            self.error();
-            return None;
-        };
+        let packet = TcpPacket::new(&buf)?;
         let flags = packet.get_flags();
         if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
             self.snd_seq.add_update(1);

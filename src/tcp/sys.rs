@@ -17,6 +17,7 @@ use crate::tcp::tcb::Tcb;
 
 #[derive(Debug)]
 pub struct TcpStreamTask {
+    quick_end: bool,
     tcb: Tcb,
     ip_stack: IpStack,
     application_layer_receiver: Receiver<BytesMut>,
@@ -39,6 +40,9 @@ impl ReadNotify {
         if self.readable.load(Ordering::Acquire) {
             self.notify.notify_one();
         }
+    }
+    pub fn close(&self) {
+        self.notify.notify_one();
     }
     async fn notified(&self) {
         self.notify.notified().await
@@ -66,6 +70,7 @@ impl TcpStreamTask {
         packet_receiver: Receiver<TransportPacket>,
     ) -> Self {
         Self {
+            quick_end: ip_stack.config.tcp_config.quick_end,
             tcb,
             ip_stack,
             application_layer_receiver,
@@ -91,6 +96,9 @@ impl TcpStreamTask {
     pub async fn run0(&mut self) -> io::Result<()> {
         loop {
             if self.tcb.is_close() {
+                return Ok(());
+            }
+            if self.quick_end && self.read_half_closed() && self.write_half_closed {
                 return Ok(());
             }
             if !self.write_half_closed && !self.retransmission {
@@ -358,13 +366,15 @@ impl TcpStreamTask {
 impl TcpStreamTask {
     pub async fn connect(&mut self) -> io::Result<()> {
         let mut count = 0;
+        let mut time = 50;
         while let Some(packet) = self.tcb.try_syn_sent() {
             count += 1;
             if count > 50 {
                 break;
             }
             self.send_packet(packet).await?;
-            return match self.recv_in_timeout(Duration::from_millis(5000)).await {
+            time *= 2;
+            return match self.recv_in_timeout(Duration::from_millis(time.min(3000))).await {
                 TaskRecvData::In(buf) => {
                     if let Some(relay) = self.tcb.try_syn_sent_to_established(buf) {
                         self.send_packet(relay).await?;
