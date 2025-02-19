@@ -27,9 +27,9 @@ pub async fn main() -> anyhow::Result<()> {
         mtu: MTU,
         ..Default::default()
     };
-    let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
-    let icmp_socket = IcmpSocket::bind_all(ip_stack.clone()).await?;
-    let icmp_v6_socket = IcmpV6Socket::bind_all(ip_stack.clone()).await?;
+    let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
+    let icmp_socket = IcmpSocket::bind_all().await?;
+    let icmp_v6_socket = IcmpV6Socket::bind_all().await?;
 
     let h1 = tokio::spawn(async {
         if let Err(e) = icmp_v4_recv(icmp_socket).await {

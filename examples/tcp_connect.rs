@@ -25,7 +25,7 @@ pub async fn main() -> anyhow::Result<()> {
         mtu: MTU,
         ..Default::default()
     };
-    let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
+    let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let dev1 = dev.clone();
     tokio::spawn(async {
         if let Err(e) = tun_to_ip_stack(dev1, ip_stack_send).await {
@@ -71,9 +71,7 @@ pub async fn main() -> anyhow::Result<()> {
     });
     let peer_addr = SocketAddrV4::new(local_ip, 18888);
     log::info!("tcp_ip_stream connecting. addr:{peer_addr}");
-    let mut tcp_ip_stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(), "10.0.0.2:18889")?
-        .connect_to(peer_addr)
-        .await?;
+    let mut tcp_ip_stream = tcp_ip::tcp::TcpStream::bind("10.0.0.2:18889")?.connect_to(peer_addr).await?;
     log::info!("tcp_ip_stream connection successful. addr:{peer_addr}");
     tcp_ip_stream.write_all(b"hi").await?;
     let mut buf = [0; 1024];

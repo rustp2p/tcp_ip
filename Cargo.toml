@@ -34,18 +34,19 @@ clap = { version = "4", features = ["derive"] }
 
 [[example]]
 name = "tcp"
-
+required-features = ["global-ip-stack"]
 [[example]]
 name = "udp"
-
+required-features = ["global-ip-stack"]
 [[example]]
 name = "icmp"
-
+required-features = ["global-ip-stack"]
 [[example]]
 name = "ipv4_ipv6"
-
+required-features = ["global-ip-stack"]
 [[example]]
 name = "tcp_proxy"
-
+required-features = ["global-ip-stack"]
 [[example]]
 name = "tcp_connect"
+required-features = ["global-ip-stack"]

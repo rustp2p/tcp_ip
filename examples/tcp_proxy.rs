@@ -35,8 +35,8 @@ pub async fn main() -> anyhow::Result<()> {
         mtu: MTU,
         ..Default::default()
     };
-    let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
-    let mut tcp_listener = TcpListener::bind_all(ip_stack.clone()).await?;
+    let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
+    let mut tcp_listener = TcpListener::bind_all().await?;
 
     let h1 = tokio::spawn(async move {
         loop {

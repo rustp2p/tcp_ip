@@ -1195,6 +1195,9 @@ impl IpStack {
             Err(io::Error::new(io::ErrorKind::Other, "Not initialized IpStack"))
         }
     }
+    pub fn release() {
+        _ = IP_STACK.lock().take();
+    }
     pub(crate) fn set(ip_stack: IpStack) {
         IP_STACK.lock().replace(ip_stack);
     }

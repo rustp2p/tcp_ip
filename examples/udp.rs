@@ -25,10 +25,10 @@ pub async fn main() -> anyhow::Result<()> {
         mtu: MTU,
         ..Default::default()
     };
-    let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
-    let udp_socket = UdpSocket::bind_all(ip_stack.clone()).await?;
+    let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
+    let udp_socket = UdpSocket::bind_all().await?;
     // Bind to a specific address
-    let udp_socket_8080 = UdpSocket::bind(ip_stack.clone(), "0.0.0.0:8080").await?;
+    let udp_socket_8080 = UdpSocket::bind("0.0.0.0:8080").await?;
 
     let h1 = tokio::spawn(async {
         if let Err(e) = udp_recv(udp_socket, "hello".into()).await {
