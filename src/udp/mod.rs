@@ -2,7 +2,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, check_ip, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, check_ip, BindAddr, IpStack, NetworkTuple, TransportPacket};
 use bytes::{BufMut, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::Packet;
@@ -29,6 +29,7 @@ use pnet_packet::Packet;
 ///
 /// [`Arc`]: std::sync::Arc
 pub struct UdpSocket {
+    _bind_addr: Option<BindAddr>,
     ip_stack: IpStack,
     packet_receiver: flume::Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
@@ -44,10 +45,16 @@ impl UdpSocket {
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
         Self::bind0(ip_stack, Some(local_addr), None).await
     }
-    async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
+    async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
+        let _bind_addr = if let Some(addr) = &mut local_addr {
+            Some(ip_stack.bind(IpNextHeaderProtocols::Udp, addr)?)
+        } else {
+            None
+        };
         ip_stack.add_udp_socket(local_addr, peer_addr, packet_sender)?;
         Ok(Self {
+            _bind_addr,
             ip_stack,
             packet_receiver,
             local_addr,

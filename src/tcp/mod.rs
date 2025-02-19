@@ -12,11 +12,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
+pub use tcb::TcpConfig;
+
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, check_ip, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, check_ip, default_addr, BindAddr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
-pub use tcb::TcpConfig;
 
 mod sys;
 mod tcb;
@@ -47,6 +48,7 @@ mod tcp_queue;
 /// }
 /// ```
 pub struct TcpListener {
+    _bind_addr: Option<BindAddr>,
     ip_stack: IpStack,
     packet_receiver: Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
@@ -76,6 +78,7 @@ pub struct TcpListener {
 /// }
 /// ```
 pub struct TcpStream {
+    bind_addr: Option<BindAddr>,
     ip_stack: Option<IpStack>,
     local_addr: SocketAddr,
     peer_addr: Option<SocketAddr>,
@@ -103,15 +106,24 @@ impl TcpListener {
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
         Self::bind0(ip_stack, Some(local_addr)).await
     }
-    async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>) -> io::Result<Self> {
+    async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
+        let _bind_addr = if let Some(addr) = &mut local_addr {
+            Some(ip_stack.bind(IpNextHeaderProtocols::Tcp, addr)?)
+        } else {
+            None
+        };
         ip_stack.add_tcp_listener(local_addr, packet_sender)?;
         Ok(Self {
+            _bind_addr,
             ip_stack,
             packet_receiver,
             local_addr,
             tcb_map: Default::default(),
         })
+    }
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
     pub async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
@@ -169,14 +181,16 @@ impl TcpListener {
 
 impl TcpStream {
     pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
-        let local_addr = local_addr.to_addr()?;
-        if local_addr.port() == 0 {
-            return Err(Error::new(io::ErrorKind::InvalidInput, "invalid port"));
-        }
+        let mut local_addr = local_addr.to_addr()?;
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
-        Ok(Self::new_uncheck(Some(ip_stack), local_addr, None, None, None))
+        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr)?;
+        Ok(Self::new_uncheck(Some(bind_addr), Some(ip_stack), local_addr, None, None, None))
     }
-    pub async fn connect<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
+    pub async fn connect<A: ToSocketAddr>(ip_stack: IpStack, dest: A) -> io::Result<Self> {
+        let dest = dest.to_addr()?;
+        TcpStream::bind(ip_stack, default_addr(dest.is_ipv4()))?.connect_to(dest).await
+    }
+    pub async fn connect_to<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
         let dest = dest.to_addr()?;
         check_addr(dest)?;
         let Some(ip_stack) = self.ip_stack else {
@@ -194,7 +208,7 @@ impl TcpStream {
             }
         }
 
-        Self::connect0(ip_stack, src, dest).await
+        Self::connect0(self.bind_addr, ip_stack, src, dest).await
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
@@ -229,7 +243,12 @@ impl TcpStream {
             Err(Error::from(io::ErrorKind::NotConnected))
         }
     }
-    pub(crate) async fn connect0(ip_stack: IpStack, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<Self> {
+    pub(crate) async fn connect0(
+        bind_addr: Option<BindAddr>,
+        ip_stack: IpStack,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> io::Result<Self> {
         let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
         let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size);
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
@@ -240,7 +259,7 @@ impl TcpStream {
             tcp_config.mss.replace(ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
         }
         let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
-        let mut stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
+        let mut stream_task = TcpStreamTask::new(bind_addr, tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         stream_task.connect().await?;
         let read_notify = stream_task.read_notify();
         let mss = stream_task.mss() as usize;
@@ -258,10 +277,11 @@ impl TcpStream {
             mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
-        let stream = Self::new_uncheck(None, local_addr, Some(peer_addr), Some(read), Some(write));
+        let stream = Self::new_uncheck(None, None, local_addr, Some(peer_addr), Some(read), Some(write));
         Ok(stream)
     }
     fn new_uncheck(
+        bind_addr: Option<BindAddr>,
         ip_stack: Option<IpStack>,
         local_addr: SocketAddr,
         peer_addr: Option<SocketAddr>,
@@ -269,6 +289,7 @@ impl TcpStream {
         write: Option<TcpStreamWriteHalf>,
     ) -> Self {
         Self {
+            bind_addr,
             ip_stack,
             local_addr,
             peer_addr,
@@ -285,7 +306,7 @@ impl TcpStream {
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
         let mss = tcb.mss() as usize;
-        let stream_task = TcpStreamTask::new(tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
+        let stream_task = TcpStreamTask::new(None, tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         let read_notify = stream_task.read_notify();
         let read = TcpStreamReadHalf {
             read_notify,
@@ -296,7 +317,7 @@ impl TcpStream {
             mss,
             payload_sender: PollSender::new(payload_sender_w),
         };
-        let stream = Self::new_uncheck(None, local_addr, Some(peer_addr), Some(read), Some(write));
+        let stream = Self::new_uncheck(None, None, local_addr, Some(peer_addr), Some(read), Some(write));
         Ok((stream, stream_task))
     }
     pub(crate) fn new(ip_stack: IpStack, tcb: Tcb) -> io::Result<Self> {

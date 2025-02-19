@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::ip_stack::{check_ip, default_ip, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_ip, default_ip, BindAddr, IpStack, NetworkTuple, TransportPacket};
 use bytes::BytesMut;
 pub use pnet_packet::ip::IpNextHeaderProtocol;
 pub use pnet_packet::ip::IpNextHeaderProtocols;
@@ -10,6 +10,7 @@ pub use pnet_packet::ip::IpNextHeaderProtocols;
 /// The read and write operations of Ipv4Socket do not include the IP header.
 /// For reading and writing, only the upper-layer protocol data of IP needs to be considered.
 pub struct IpSocket {
+    _bind_addr: Option<BindAddr>,
     protocol: Option<IpNextHeaderProtocol>,
     ip_stack: IpStack,
     packet_receiver: flume::Receiver<TransportPacket>,
@@ -30,9 +31,16 @@ impl IpSocket {
         local_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
         let local_addr = local_ip.map(|ip| SocketAddr::new(ip, 0));
+        let _bind_addr = if let (Some(protocol), Some(local_addr)) = (protocol, local_addr) {
+            Some(ip_stack.bind_ip(protocol, local_addr)?)
+        } else {
+            None
+        };
+
         let (packet_sender, packet_receiver) = flume::bounded(channel_size);
         ip_stack.add_ip_socket(protocol, local_addr, packet_sender)?;
         Ok(Self {
+            _bind_addr,
             protocol,
             ip_stack,
             packet_receiver,

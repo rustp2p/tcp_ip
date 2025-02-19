@@ -5,12 +5,13 @@ use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::Packet;
-use std::collections::HashMap;
+use rand::Rng;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use std::{io, u128};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 
@@ -122,6 +123,7 @@ pub(crate) struct IpStackInner {
     pub(crate) udp_socket_map: DashMap<(Option<SocketAddr>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
+    bind_addrs: Mutex<HashSet<(IpNextHeaderProtocol, SocketAddr)>>,
 }
 
 /// Send IP packets to the protocol stack using `IpStackSend`
@@ -288,6 +290,7 @@ impl IpStack {
                 udp_socket_map: Default::default(),
                 raw_socket_map: Default::default(),
                 packet_sender,
+                bind_addrs: Default::default(),
             }),
         }
     }
@@ -344,7 +347,7 @@ impl IpStack {
     fn add_socket0<K: Eq + PartialEq + Hash, V>(map: &DashMap<K, V>, local_addr: K, packet_sender: V) -> io::Result<()> {
         let entry = map.entry(local_addr);
         match entry {
-            Entry::Occupied(_entry) => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+            Entry::Occupied(_entry) => Err(io::Error::from(io::ErrorKind::AddrInUse)),
             Entry::Vacant(entry) => {
                 entry.insert(packet_sender);
                 Ok(())
@@ -356,6 +359,23 @@ impl IpStack {
             Ok(_) => Ok(()),
             Err(_) => Err(io::Error::new(io::ErrorKind::WriteZero, "ip stack close")),
         }
+    }
+    pub(crate) fn bind(&self, protocol: IpNextHeaderProtocol, addr: &mut SocketAddr) -> io::Result<BindAddr> {
+        let bind_address = self.inner.add_bind_addr(protocol, *addr, true)?;
+        *addr = bind_address;
+        Ok(BindAddr {
+            protocol,
+            addr: bind_address,
+            inner: self.inner.clone(),
+        })
+    }
+    pub(crate) fn bind_ip(&self, protocol: IpNextHeaderProtocol, addr: SocketAddr) -> io::Result<BindAddr> {
+        _ = self.inner.add_bind_addr(protocol, addr, false)?;
+        Ok(BindAddr {
+            protocol,
+            addr,
+            inner: self.inner.clone(),
+        })
     }
 }
 
@@ -1081,5 +1101,46 @@ impl Routes {
             self.v6_list.push(ip);
         }
         self.default_v6 = Some(ip)
+    }
+}
+
+impl IpStackInner {
+    fn add_bind_addr(&self, protocol: IpNextHeaderProtocol, mut addr: SocketAddr, set_port: bool) -> io::Result<SocketAddr> {
+        let mut guard = self.bind_addrs.lock();
+        if set_port && addr.port() == 0 {
+            let port_start: u16 = rand::rng().random_range(1..=65535);
+            for i in 0..65535 {
+                let port = port_start.wrapping_add(i);
+                if port == 0 {
+                    continue;
+                }
+                addr.set_port(port);
+                if !guard.contains(&(protocol, addr)) {
+                    guard.insert((protocol, addr));
+                    return Ok(addr);
+                }
+            }
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "Address already in use"));
+        }
+        if guard.contains(&(protocol, addr)) {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "Address already in use"));
+        }
+        guard.insert((protocol, addr));
+        Ok(addr)
+    }
+    fn remove_bind_addr(&self, protocol: IpNextHeaderProtocol, addr: SocketAddr) {
+        let mut guard = self.bind_addrs.lock();
+        guard.remove(&(protocol, addr));
+    }
+}
+#[derive(Debug)]
+pub(crate) struct BindAddr {
+    protocol: IpNextHeaderProtocol,
+    pub(crate) addr: SocketAddr,
+    inner: Arc<IpStackInner>,
+}
+impl Drop for BindAddr {
+    fn drop(&mut self) {
+        self.inner.remove_bind_addr(self.protocol, self.addr);
     }
 }

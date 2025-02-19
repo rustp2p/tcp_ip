@@ -12,11 +12,12 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::ip_stack::{IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{BindAddr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::tcb::Tcb;
 
 #[derive(Debug)]
 pub struct TcpStreamTask {
+    _bind_addr: Option<BindAddr>,
     quick_end: bool,
     tcb: Tcb,
     ip_stack: IpStack,
@@ -63,6 +64,7 @@ impl Drop for TcpStreamTask {
 
 impl TcpStreamTask {
     pub fn new(
+        _bind_addr: Option<BindAddr>,
         tcb: Tcb,
         ip_stack: IpStack,
         application_layer_sender: Sender<BytesMut>,
@@ -70,6 +72,7 @@ impl TcpStreamTask {
         packet_receiver: Receiver<TransportPacket>,
     ) -> Self {
         Self {
+            _bind_addr,
             quick_end: ip_stack.config.tcp_config.quick_end,
             tcb,
             ip_stack,
