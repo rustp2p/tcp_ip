@@ -971,11 +971,17 @@ impl SafeRoutes {
     pub fn clear_v6(&self) {
         self.routes.lock().clear_v6()
     }
-    pub fn default_v4(&self, ip: Ipv4Addr) {
-        self.routes.lock().default_v4(ip)
+    pub fn set_default_v4(&self, ip: Ipv4Addr) {
+        self.routes.lock().set_default_v4(ip)
     }
-    pub fn default_v6(&self, ip: Ipv6Addr) {
-        self.routes.lock().default_v6(ip)
+    pub fn set_default_v6(&self, ip: Ipv6Addr) {
+        self.routes.lock().set_default_v6(ip)
+    }
+    pub fn default_v4(&self) -> Option<Ipv4Addr> {
+        self.routes.lock().default_v4()
+    }
+    pub fn default_v6(&self) -> Option<Ipv6Addr> {
+        self.routes.lock().default_v6()
     }
 }
 
@@ -1090,17 +1096,23 @@ impl Routes {
     fn clear_v6(&mut self) {
         self.v6_table.clear();
     }
-    fn default_v4(&mut self, ip: Ipv4Addr) {
+    fn set_default_v4(&mut self, ip: Ipv4Addr) {
         if !self.v4_list.contains(&ip) {
             self.v4_list.push(ip);
         }
         self.default_v4 = Some(ip)
     }
-    fn default_v6(&mut self, ip: Ipv6Addr) {
+    fn set_default_v6(&mut self, ip: Ipv6Addr) {
         if !self.v6_list.contains(&ip) {
             self.v6_list.push(ip);
         }
         self.default_v6 = Some(ip)
+    }
+    fn default_v4(&self) -> Option<Ipv4Addr> {
+        self.default_v4
+    }
+    fn default_v6(&self) -> Option<Ipv6Addr> {
+        self.default_v6
     }
 }
 
