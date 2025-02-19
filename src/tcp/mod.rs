@@ -34,6 +34,7 @@ mod tcp_queue;
 /// }
 ///
 /// #[tokio::main]
+/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> io::Result<()> {
 ///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
 ///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
@@ -60,6 +61,7 @@ pub struct TcpListener {
 /// # Example
 /// ```no_run
 /// #[tokio::main]
+/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> std::io::Result<()> {
 ///     // Connect to a peer
 ///     use tokio::io::AsyncWriteExt;
@@ -96,7 +98,19 @@ pub struct TcpStreamWriteHalf {
     mss: usize,
     payload_sender: PollSender<BytesMut>,
 }
-
+#[cfg(feature = "global-ip-stack")]
+impl TcpListener {
+    pub async fn bind_all() -> io::Result<Self> {
+        Self::bind0(IpStack::get()?, None).await
+    }
+    pub async fn bind<A: ToSocketAddr>(local_addr: A) -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        let local_addr = local_addr.to_addr()?;
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
+        Self::bind0(ip_stack, Some(local_addr)).await
+    }
+}
+#[cfg(not(feature = "global-ip-stack"))]
 impl TcpListener {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
         Self::bind0(ip_stack, None).await
@@ -106,6 +120,8 @@ impl TcpListener {
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
         Self::bind0(ip_stack, Some(local_addr)).await
     }
+}
+impl TcpListener {
     async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
         let _bind_addr = if let Some(addr) = &mut local_addr {
@@ -178,7 +194,21 @@ impl TcpListener {
         }
     }
 }
-
+#[cfg(feature = "global-ip-stack")]
+impl TcpStream {
+    pub fn bind<A: ToSocketAddr>(local_addr: A) -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        let mut local_addr = local_addr.to_addr()?;
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
+        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr)?;
+        Ok(Self::new_uncheck(Some(bind_addr), Some(ip_stack), local_addr, None, None, None))
+    }
+    pub async fn connect<A: ToSocketAddr>(dest: A) -> io::Result<Self> {
+        let dest = dest.to_addr()?;
+        TcpStream::bind(default_addr(dest.is_ipv4()))?.connect_to(dest).await
+    }
+}
+#[cfg(not(feature = "global-ip-stack"))]
 impl TcpStream {
     pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
         let mut local_addr = local_addr.to_addr()?;
@@ -190,6 +220,8 @@ impl TcpStream {
         let dest = dest.to_addr()?;
         TcpStream::bind(ip_stack, default_addr(dest.is_ipv4()))?.connect_to(dest).await
     }
+}
+impl TcpStream {
     pub async fn connect_to<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
         let dest = dest.to_addr()?;
         check_addr(dest)?;

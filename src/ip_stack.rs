@@ -226,6 +226,7 @@ impl IdKey {
 /// # Examples
 /// ```rust
 /// use tcp_ip::tcp::TcpListener;
+/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main(){
 ///     let (ip_stack, ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
 ///     // Use ip_stack_send and ip_stack_recv to interface
@@ -234,7 +235,32 @@ impl IdKey {
 ///     let mut tcp_listener = TcpListener::bind_all(ip_stack.clone()).await?;
 /// }
 /// ```
+#[cfg(not(feature = "global-ip-stack"))]
 pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStackRecv)> {
+    ip_stack0(config)
+}
+
+/// Create a user-space protocol stack.
+///
+/// # Examples
+/// ```rust
+/// use tcp_ip::tcp::TcpListener;
+/// #[cfg(feature = "global-ip-stack")]
+/// async fn main(){
+///     let (ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
+///     // Use ip_stack_send and ip_stack_recv to interface
+///     // with the input and output of IP packets.
+///     // ...
+///     let mut tcp_listener = TcpListener::bind_all().await?;
+/// }
+/// ```
+#[cfg(feature = "global-ip-stack")]
+pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStackSend, IpStackRecv)> {
+    let (ip_stack, ip_stack_send, ip_stack_recv) = ip_stack0(config)?;
+    IpStack::set(ip_stack);
+    Ok((ip_stack_send, ip_stack_recv))
+}
+fn ip_stack0(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStackRecv)> {
     config.check()?;
     let (packet_sender, packet_receiver) = channel(config.channel_size);
     let ip_stack = IpStack::new(config, packet_sender);
@@ -250,7 +276,6 @@ pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpSt
     }
     Ok((ip_stack, ip_stack_send, ip_stack_recv))
 }
-
 async fn loop_check_timeouts(timeout: Duration, ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>, notify: Arc<Notify>) {
     let notified = notify.notified();
     tokio::pin!(notified);
@@ -1154,5 +1179,23 @@ pub(crate) struct BindAddr {
 impl Drop for BindAddr {
     fn drop(&mut self) {
         self.inner.remove_bind_addr(self.protocol, self.addr);
+    }
+}
+
+#[cfg(feature = "global-ip-stack")]
+lazy_static::lazy_static! {
+    static ref IP_STACK: Mutex<Option<IpStack>> = Mutex::new(None);
+}
+#[cfg(feature = "global-ip-stack")]
+impl IpStack {
+    pub fn get() -> io::Result<IpStack> {
+        if let Some(v) = IP_STACK.lock().clone() {
+            Ok(v)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "Not initialized IpStack"))
+        }
+    }
+    pub(crate) fn set(ip_stack: IpStack) {
+        IP_STACK.lock().replace(ip_stack);
     }
 }

@@ -35,7 +35,20 @@ pub struct UdpSocket {
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
 }
-
+#[cfg(feature = "global-ip-stack")]
+impl UdpSocket {
+    pub async fn bind_all() -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        Self::bind0(ip_stack, None, None).await
+    }
+    pub async fn bind<A: ToSocketAddr>(local_addr: A) -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        let local_addr = local_addr.to_addr()?;
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
+        Self::bind0(ip_stack, Some(local_addr), None).await
+    }
+}
+#[cfg(not(feature = "global-ip-stack"))]
 impl UdpSocket {
     pub async fn bind_all(ip_stack: IpStack) -> io::Result<Self> {
         Self::bind0(ip_stack, None, None).await
@@ -45,6 +58,9 @@ impl UdpSocket {
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
         Self::bind0(ip_stack, Some(local_addr), None).await
     }
+}
+
+impl UdpSocket {
     async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
         let _bind_addr = if let Some(addr) = &mut local_addr {

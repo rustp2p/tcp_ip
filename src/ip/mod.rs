@@ -16,7 +16,18 @@ pub struct IpSocket {
     packet_receiver: flume::Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
 }
-
+#[cfg(feature = "global-ip-stack")]
+impl IpSocket {
+    pub async fn bind_all(protocol: Option<IpNextHeaderProtocol>) -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, None).await
+    }
+    pub async fn bind(protocol: Option<IpNextHeaderProtocol>, local_ip: IpAddr) -> io::Result<Self> {
+        let ip_stack = IpStack::get()?;
+        Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, Some(local_ip)).await
+    }
+}
+#[cfg(not(feature = "global-ip-stack"))]
 impl IpSocket {
     pub async fn bind_all(protocol: Option<IpNextHeaderProtocol>, ip_stack: IpStack) -> io::Result<Self> {
         Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, None).await
@@ -24,6 +35,8 @@ impl IpSocket {
     pub async fn bind(protocol: Option<IpNextHeaderProtocol>, ip_stack: IpStack, local_ip: IpAddr) -> io::Result<Self> {
         Self::bind0(ip_stack.config.ip_channel_size, protocol, ip_stack, Some(local_ip)).await
     }
+}
+impl IpSocket {
     pub(crate) async fn bind0(
         channel_size: usize,
         protocol: Option<IpNextHeaderProtocol>,
