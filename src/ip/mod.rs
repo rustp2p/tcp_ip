@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::ip_stack::{check_ip, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_ip, default_ip, IpStack, NetworkTuple, TransportPacket};
 use bytes::BytesMut;
 pub use pnet_packet::ip::IpNextHeaderProtocol;
 pub use pnet_packet::ip::IpNextHeaderProtocols;
@@ -52,10 +52,12 @@ impl IpSocket {
         Ok((len, src))
     }
     pub async fn send_to(&self, buf: &[u8], addr: IpAddr) -> io::Result<usize> {
-        let Some(from) = self.local_addr else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
+        let from = if let Some(from) = self.local_addr {
+            from.ip()
+        } else {
+            default_ip(addr.is_ipv4())
         };
-        self.send_from_to(buf, from.ip(), addr).await
+        self.send_from_to(buf, from, addr).await
     }
     pub async fn recv_from_to(&self, buf: &mut [u8]) -> io::Result<(usize, IpAddr, IpAddr)> {
         let (len, _p, src, dst) = self.recv_protocol_from_to(buf).await?;
@@ -87,7 +89,13 @@ impl IpSocket {
         };
         self.send_protocol_from_to(buf, protocol, src, dst).await
     }
-    pub async fn send_protocol_from_to(&self, buf: &[u8], protocol: IpNextHeaderProtocol, src: IpAddr, dst: IpAddr) -> io::Result<usize> {
+    pub async fn send_protocol_from_to(
+        &self,
+        buf: &[u8],
+        protocol: IpNextHeaderProtocol,
+        mut src: IpAddr,
+        dst: IpAddr,
+    ) -> io::Result<usize> {
         if let Some(p) = self.protocol {
             if p != protocol {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "inconsistent protocol"));
@@ -99,9 +107,14 @@ impl IpSocket {
         if src.is_ipv4() != dst.is_ipv4() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
         }
-        check_ip(src)?;
         check_ip(dst)?;
-
+        if let Err(e) = check_ip(src) {
+            if let Some(v) = self.ip_stack.routes().route(dst) {
+                src = v;
+            } else {
+                Err(e)?
+            }
+        }
         let data: BytesMut = buf.into();
         let src = SocketAddr::new(src, 0);
         let dst = SocketAddr::new(dst, 0);

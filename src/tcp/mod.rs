@@ -187,7 +187,7 @@ impl TcpStream {
             return Err(Error::new(io::ErrorKind::InvalidInput, "address error"));
         }
         if let Err(e) = check_ip(src.ip()) {
-            if let Some(v) = ip_stack.routes().route(src.ip()) {
+            if let Some(v) = ip_stack.routes().route(dest.ip()) {
                 src.set_ip(v);
             } else {
                 Err(e)?

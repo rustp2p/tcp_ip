@@ -41,11 +41,7 @@ impl UdpSocket {
     }
     pub async fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
         let local_addr = local_addr.to_addr()?;
-        if check_ip(local_addr.ip()).is_ok() {
-            if !ip_stack.routes().exists_ip(&local_addr.ip()) {
-                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "cannot assign requested address"));
-            }
-        }
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
         Self::bind0(ip_stack, Some(local_addr), None).await
     }
     async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
@@ -92,8 +88,7 @@ impl UdpSocket {
         self.send_from_to0(buf, src.to_addr()?, dst.to_addr()?).await
     }
     async fn send_from_to0(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<usize> {
-        check_addr(src)?;
-        check_addr(dst)?;
+        let src = self.src_addr0(src, dst)?;
         if buf.len() > u16::MAX as usize - 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "buf too long"));
         }
@@ -126,23 +121,30 @@ impl UdpSocket {
         self.ip_stack.send_packet(packet).await?;
         Ok(buf.len())
     }
-}
-impl UdpSocket {
-    pub async fn connect(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
-        let Some(mut local_addr) = self.local_addr else {
+    fn src_addr(&self, peer_addr: SocketAddr) -> io::Result<SocketAddr> {
+        let Some(local_addr) = self.local_addr else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
         };
+        self.src_addr0(local_addr, peer_addr)
+    }
+    fn src_addr0(&self, mut local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<SocketAddr> {
         check_addr(peer_addr)?;
         if local_addr.port() == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port"));
         }
         if let Err(e) = check_ip(local_addr.ip()) {
-            if let Some(v) = self.ip_stack.routes().route(local_addr.ip()) {
+            if let Some(v) = self.ip_stack.routes().route(peer_addr.ip()) {
                 local_addr.set_ip(v);
             } else {
                 Err(e)?
             }
         }
+        Ok(local_addr)
+    }
+}
+impl UdpSocket {
+    pub async fn connect(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
+        let local_addr = self.src_addr(peer_addr)?;
         self.ip_stack
             .replace_udp_socket((self.local_addr, self.peer_addr), (Some(local_addr), Some(peer_addr)))?;
         self.local_addr = Some(local_addr);
