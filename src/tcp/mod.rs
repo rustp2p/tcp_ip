@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::PollSender;
 
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, check_ip, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 pub use tcb::TcpConfig;
@@ -99,7 +99,9 @@ impl TcpListener {
         Self::bind0(ip_stack, None).await
     }
     pub async fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
-        Self::bind0(ip_stack, Some(local_addr.to_addr()?)).await
+        let local_addr = local_addr.to_addr()?;
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
+        Self::bind0(ip_stack, Some(local_addr)).await
     }
     async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
@@ -166,21 +168,32 @@ impl TcpListener {
 }
 
 impl TcpStream {
-    pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, src: A) -> io::Result<Self> {
-        let src = src.to_addr()?;
-        check_addr(src)?;
-        Ok(Self::new_uncheck(Some(ip_stack), src, None, None, None))
+    pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
+        let local_addr = local_addr.to_addr()?;
+        if local_addr.port() == 0 {
+            return Err(Error::new(io::ErrorKind::InvalidInput, "invalid port"));
+        }
+        ip_stack.routes().check_bind_ip(local_addr.ip())?;
+        Ok(Self::new_uncheck(Some(ip_stack), local_addr, None, None, None))
     }
     pub async fn connect<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
         let dest = dest.to_addr()?;
         check_addr(dest)?;
         let Some(ip_stack) = self.ip_stack else {
-            return Err(Error::new(io::ErrorKind::NotFound, "not bind"));
+            return Err(Error::new(io::ErrorKind::AlreadyExists, "transport endpoint is already connected"));
         };
-        let src = self.local_addr;
+        let mut src = self.local_addr;
         if src.is_ipv4() != dest.is_ipv4() {
             return Err(Error::new(io::ErrorKind::InvalidInput, "address error"));
         }
+        if let Err(e) = check_ip(src.ip()) {
+            if let Some(v) = ip_stack.routes().route(src.ip()) {
+                src.set_ip(v);
+            } else {
+                Err(e)?
+            }
+        }
+
         Self::connect0(ip_stack, src, dest).await
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {

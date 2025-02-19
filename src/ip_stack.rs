@@ -7,10 +7,10 @@ use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::Packet;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::{io, u128};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 
@@ -110,6 +110,7 @@ impl Default for IpStackConfig {
 /// Context information of protocol stack
 #[derive(Clone, Debug)]
 pub struct IpStack {
+    routes: SafeRoutes,
     pub(crate) config: Box<IpStackConfig>,
     pub(crate) inner: Arc<IpStackInner>,
 }
@@ -271,10 +272,15 @@ fn check_timeouts(ident_fragments_map: &Mutex<HashMap<IdKey, IpFragments>>, time
         ident_fragments_map.retain(|_id_key, p| p.time + timeout > now)
     }
 }
-
+impl IpStack {
+    pub fn routes(&self) -> &SafeRoutes {
+        &self.routes
+    }
+}
 impl IpStack {
     pub(crate) fn new(config: IpStackConfig, packet_sender: Sender<TransportPacket>) -> Self {
         Self {
+            routes: Default::default(),
             config: Box::new(config),
             inner: Arc::new(IpStackInner {
                 tcp_stream_map: Default::default(),
@@ -884,5 +890,192 @@ impl<T> SenderBox<T> {
             SenderBox::Mpsc(sender) => sender.send(t).await.is_ok(),
             SenderBox::Mpmc(sender) => sender.send_async(t).await.is_ok(),
         }
+    }
+}
+#[derive(Clone, Default, Debug)]
+pub struct SafeRoutes {
+    routes: Arc<Mutex<Routes>>,
+}
+impl SafeRoutes {
+    pub(crate) fn check_bind_ip(&self, ip: IpAddr) -> io::Result<()> {
+        if check_ip(ip).is_ok() {
+            if !self.exists_ip(&ip) {
+                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "cannot assign requested address"));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn exists_ip(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => self.exists_v4(ip),
+            IpAddr::V6(ip) => self.exists_v6(ip),
+        }
+    }
+    pub(crate) fn exists_v4(&self, ip: &Ipv4Addr) -> bool {
+        self.routes.lock().exists_v4(ip)
+    }
+    pub(crate) fn exists_v6(&self, ip: &Ipv6Addr) -> bool {
+        self.routes.lock().exists_v6(ip)
+    }
+    pub fn ipv4_list(&self) -> Vec<Ipv4Addr> {
+        self.routes.lock().v4_list.clone()
+    }
+    pub fn ipv6_list(&self) -> Vec<Ipv6Addr> {
+        self.routes.lock().v6_list.clone()
+    }
+    pub fn route(&self, dst: IpAddr) -> Option<IpAddr> {
+        match dst {
+            IpAddr::V4(ip) => self.route_v4(ip).map(|v| v.into()),
+            IpAddr::V6(ip) => self.route_v6(ip).map(|v| v.into()),
+        }
+    }
+    pub fn route_v4(&self, dst: Ipv4Addr) -> Option<Ipv4Addr> {
+        self.routes.lock().route_v4(dst)
+    }
+    pub fn route_v6(&self, dst: Ipv6Addr) -> Option<Ipv6Addr> {
+        self.routes.lock().route_v6(dst)
+    }
+    pub fn add_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, ip: Ipv4Addr) -> io::Result<()> {
+        self.routes.lock().add_v4(dest, mask, ip)
+    }
+    pub fn add_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr, ip: Ipv6Addr) -> io::Result<()> {
+        self.routes.lock().add_v6(dest, mask, ip)
+    }
+    pub fn remove_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) -> io::Result<()> {
+        self.routes.lock().remove_v4(dest, mask)
+    }
+    pub fn remove_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr) -> io::Result<()> {
+        self.routes.lock().remove_v6(dest, mask)
+    }
+    pub fn clear_v4(&mut self) {
+        self.routes.lock().clear_v4()
+    }
+    pub fn clear_v6(&mut self) {
+        self.routes.lock().clear_v6()
+    }
+    pub fn default_v4(&mut self, ip: Ipv4Addr) {
+        self.routes.lock().default_v4(ip)
+    }
+    pub fn default_v6(&mut self, ip: Ipv6Addr) {
+        self.routes.lock().default_v6(ip)
+    }
+}
+
+#[derive(Default, Debug)]
+struct Routes {
+    v4_list: Vec<Ipv4Addr>,
+    default_v4: Option<Ipv4Addr>,
+    v4_table: Vec<(u32, u32, Ipv4Addr)>,
+    v6_list: Vec<Ipv6Addr>,
+    default_v6: Option<Ipv6Addr>,
+    v6_table: Vec<(u128, u128, Ipv6Addr)>,
+}
+impl Routes {
+    fn exists_v4(&self, ip: &Ipv4Addr) -> bool {
+        if self.v4_list.is_empty() {
+            return true;
+        }
+        self.v4_list.contains(ip)
+    }
+    fn exists_v6(&self, ip: &Ipv6Addr) -> bool {
+        if self.v6_list.is_empty() {
+            return true;
+        }
+        self.v6_list.contains(ip)
+    }
+    fn route_v4(&self, dst: Ipv4Addr) -> Option<Ipv4Addr> {
+        let dst = u32::from(dst);
+        for (dest_cur, mask_cur, ip_cur) in self.v4_table.iter() {
+            if dst & *mask_cur == *dest_cur {
+                return Some(*ip_cur);
+            }
+        }
+        self.default_v4
+    }
+    fn route_v6(&self, dst: Ipv6Addr) -> Option<Ipv6Addr> {
+        let dst = u128::from(dst);
+        for (dest_cur, mask_cur, ip_cur) in self.v6_table.iter() {
+            if dst & *mask_cur == *dest_cur {
+                return Some(*ip_cur);
+            }
+        }
+        self.default_v6
+    }
+    fn add_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, ip: Ipv4Addr) -> io::Result<()> {
+        let mask = u32::from(mask);
+        if mask.count_ones() != mask.leading_ones() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid mask"));
+        }
+        if !self.v4_list.contains(&ip) {
+            self.v4_list.push(ip);
+        }
+        let dest = u32::from(dest) & mask;
+        for (dest_cur, mask_cur, ip_cur) in self.v4_table.iter_mut() {
+            if dest == *dest_cur && mask == *mask_cur {
+                *ip_cur = ip;
+                return Ok(());
+            }
+        }
+        self.v4_table.push((dest, mask, ip));
+        self.v4_table.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(())
+    }
+    fn add_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr, ip: Ipv6Addr) -> io::Result<()> {
+        let mask = u128::from(mask);
+        if mask.count_ones() != mask.leading_ones() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid mask"));
+        }
+        if !self.v6_list.contains(&ip) {
+            self.v6_list.push(ip);
+        }
+        let dest = u128::from(dest) & mask;
+        for (dest_cur, mask_cur, ip_cur) in self.v6_table.iter_mut() {
+            if dest == *dest_cur && mask == *mask_cur {
+                *ip_cur = ip;
+                return Ok(());
+            }
+        }
+        self.v6_table.push((dest, mask, ip));
+        self.v6_table.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(())
+    }
+    fn remove_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) -> io::Result<()> {
+        let mask = u32::from(mask);
+        let dest = u32::from(dest) & mask;
+        let len = self.v4_table.len();
+
+        self.v4_table
+            .retain(|(dest_cur, mask_cur, _)| !(dest == *dest_cur && mask == *mask_cur));
+        if len == self.v4_table.len() {
+            Err(io::Error::new(io::ErrorKind::NotFound, "not found route"))
+        } else {
+            self.v4_list = self.v4_table.iter().map(|v| v.2).collect();
+            Ok(())
+        }
+    }
+    fn remove_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr) -> io::Result<()> {
+        let mask = u128::from(mask);
+        let dest = u128::from(dest) & mask;
+        let len = self.v6_table.len();
+        self.v6_table
+            .retain(|(dest_cur, mask_cur, _)| !(dest == *dest_cur && mask == *mask_cur));
+        if len == self.v6_table.len() {
+            Err(io::Error::new(io::ErrorKind::NotFound, "not found route"))
+        } else {
+            self.v6_list = self.v6_table.iter().map(|v| v.2).collect();
+            Ok(())
+        }
+    }
+    fn clear_v4(&mut self) {
+        self.v4_table.clear();
+    }
+    fn clear_v6(&mut self) {
+        self.v6_table.clear();
+    }
+    fn default_v4(&mut self, ip: Ipv4Addr) {
+        self.default_v4 = Some(ip)
+    }
+    fn default_v6(&mut self, ip: Ipv6Addr) {
+        self.default_v6 = Some(ip)
     }
 }

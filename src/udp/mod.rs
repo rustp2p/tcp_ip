@@ -2,7 +2,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, check_ip, IpStack, NetworkTuple, TransportPacket};
 use bytes::{BufMut, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::Packet;
@@ -40,7 +40,13 @@ impl UdpSocket {
         Self::bind0(ip_stack, None, None).await
     }
     pub async fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
-        Self::bind0(ip_stack, Some(local_addr.to_addr()?), None).await
+        let local_addr = local_addr.to_addr()?;
+        if check_ip(local_addr.ip()).is_ok() {
+            if !ip_stack.routes().exists_ip(&local_addr.ip()) {
+                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "cannot assign requested address"));
+            }
+        }
+        Self::bind0(ip_stack, Some(local_addr), None).await
     }
     async fn bind0(ip_stack: IpStack, local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
@@ -123,13 +129,23 @@ impl UdpSocket {
 }
 impl UdpSocket {
     pub async fn connect(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
-        let Some(local_addr) = self.local_addr else {
+        let Some(mut local_addr) = self.local_addr else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "need to specify source address"));
         };
-        check_addr(local_addr)?;
         check_addr(peer_addr)?;
+        if local_addr.port() == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port"));
+        }
+        if let Err(e) = check_ip(local_addr.ip()) {
+            if let Some(v) = self.ip_stack.routes().route(local_addr.ip()) {
+                local_addr.set_ip(v);
+            } else {
+                Err(e)?
+            }
+        }
         self.ip_stack
-            .replace_udp_socket((self.local_addr, self.peer_addr), (self.local_addr, Some(peer_addr)))?;
+            .replace_udp_socket((self.local_addr, self.peer_addr), (Some(local_addr), Some(peer_addr)))?;
+        self.local_addr = Some(local_addr);
         self.peer_addr = Some(peer_addr);
         Ok(())
     }
