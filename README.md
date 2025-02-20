@@ -1,3 +1,6 @@
+[![Crates.io](https://img.shields.io/crates/v/tcp_ip.svg)](https://crates.io/crates/tcp_ip)
+[![tcp_ip](https://docs.rs/tcp_ip/badge.svg)](https://docs.rs/tcp_ip/latest/tcp_ip/)
+
 # tcp_ip
 
 User-space TCP/IP stack
