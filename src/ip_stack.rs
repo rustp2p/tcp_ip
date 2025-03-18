@@ -159,19 +159,19 @@ pub struct IpStackRecv {
     bufs: Vec<BytesMut>,
 }
 struct IpStackRecvInner {
-    ip_stack: IpStack,
+    mtu: u16,
     identification: u16,
     packet_receiver: Receiver<TransportPacket>,
 }
 
 impl IpStackRecv {
-    pub(crate) fn new(ip_stack: IpStack, packet_receiver: Receiver<TransportPacket>) -> Self {
+    pub(crate) fn new(mtu: u16, packet_receiver: Receiver<TransportPacket>) -> Self {
         let identification = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|v| (v.as_millis() & 0xFFFF) as u16)
             .unwrap_or(0);
         let inner = IpStackRecvInner {
-            ip_stack,
+            mtu,
             identification,
             packet_receiver,
         };
@@ -265,7 +265,7 @@ fn ip_stack0(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStack
     let (packet_sender, packet_receiver) = channel(config.channel_size);
     let ip_stack = IpStack::new(config, packet_sender);
     let ip_stack_send = IpStackSend::new(ip_stack.clone());
-    let ip_stack_recv = IpStackRecv::new(ip_stack.clone(), packet_receiver);
+    let ip_stack_recv = IpStackRecv::new(ip_stack.config.mtu, packet_receiver);
     {
         let ident_fragments_map = ip_stack_send.ident_fragments_map.clone();
         let notify = ip_stack_send.notify.clone();
@@ -652,7 +652,7 @@ impl IpStackRecv {
             }
             if self.bufs.is_empty() {
                 for _ in 0..128 {
-                    self.bufs.push(BytesMut::zeroed(self.inner.ip_stack.config.mtu as usize));
+                    self.bufs.push(BytesMut::zeroed(self.inner.mtu as usize));
                 }
             }
             self.num = self.inner.recv_ip_packet(&mut self.bufs, &mut self.sizes).await?;
@@ -719,7 +719,7 @@ impl IpStackRecvInner {
         Ok(1)
     }
     fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
-        let mtu = self.ip_stack.config.mtu;
+        let mtu = self.mtu;
         self.identification = self.identification.wrapping_sub(1);
         let identification = self.identification;
         let mut offset = 0;
