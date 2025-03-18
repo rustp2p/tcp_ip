@@ -441,7 +441,7 @@ impl Tcb {
                 }
                 TcpOptionNumbers::MSS => {
                     if payload.len() == 2 {
-                        self.mss = (payload[0] as u16) << 8 | (payload[1] as u16);
+                        self.mss = ((payload[0] as u16) << 8) | (payload[1] as u16);
                     }
                 }
                 TcpOptionNumbers::SACK_PERMITTED => {
