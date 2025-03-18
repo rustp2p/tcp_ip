@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -118,6 +119,7 @@ pub struct IpStack {
 
 #[derive(Debug)]
 pub(crate) struct IpStackInner {
+    active_state: AtomicBool,
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<Option<SocketAddr>, Sender<TransportPacket>>,
     pub(crate) udp_socket_map: DashMap<(Option<SocketAddr>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
@@ -125,7 +127,29 @@ pub(crate) struct IpStackInner {
     pub(crate) packet_sender: Sender<TransportPacket>,
     bind_addrs: Mutex<HashSet<(IpNextHeaderProtocol, SocketAddr)>>,
 }
-
+impl IpStackInner {
+    fn remove_all(&self) {
+        self.active_state.store(false, Ordering::SeqCst);
+        self.tcp_listener_map.clear();
+        self.tcp_stream_map.clear();
+        self.udp_socket_map.clear();
+        self.raw_socket_map.clear();
+    }
+    fn check_state(&self) -> io::Result<()> {
+        if self.active_state.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "shutdown"))
+        }
+    }
+    fn check_state_and_remove(&self) -> io::Result<()> {
+        let rs = self.check_state();
+        if rs.is_err() {
+            self.remove_all();
+        }
+        rs
+    }
+}
 /// Send IP packets to the protocol stack using `IpStackSend`
 #[derive(Clone)]
 pub struct IpStackSend {
@@ -137,6 +161,7 @@ pub struct IpStackSend {
 impl Drop for IpStackSend {
     fn drop(&mut self) {
         self.notify.notify_one();
+        self.ip_stack.inner.remove_all();
     }
 }
 
@@ -310,6 +335,7 @@ impl IpStack {
             routes: Default::default(),
             config: Box::new(config),
             inner: Arc::new(IpStackInner {
+                active_state: AtomicBool::new(true),
                 tcp_stream_map: Default::default(),
                 tcp_listener_map: Default::default(),
                 udp_socket_map: Default::default(),
@@ -325,7 +351,7 @@ impl IpStack {
         local_addr: Option<SocketAddr>,
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
-        Self::add_socket0(&self.inner.raw_socket_map, (protocol, local_addr), packet_sender)
+        Self::add_socket0(&self.inner, &self.inner.raw_socket_map, (protocol, local_addr), packet_sender)
     }
     pub(crate) fn add_udp_socket(
         &self,
@@ -333,7 +359,7 @@ impl IpStack {
         peer_addr: Option<SocketAddr>,
         packet_sender: flume::Sender<TransportPacket>,
     ) -> io::Result<()> {
-        Self::add_socket0(&self.inner.udp_socket_map, (local_addr, peer_addr), packet_sender)
+        Self::add_socket0(&self.inner, &self.inner.udp_socket_map, (local_addr, peer_addr), packet_sender)
     }
 
     pub(crate) fn replace_udp_socket(
@@ -346,19 +372,19 @@ impl IpStack {
         } else {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         };
-        Self::add_socket0(&self.inner.udp_socket_map, new, packet_sender)?;
+        Self::add_socket0(&self.inner, &self.inner.udp_socket_map, new, packet_sender)?;
         _ = self.inner.udp_socket_map.remove(&old);
         Ok(())
     }
 
     pub(crate) fn add_tcp_listener(&self, local_addr: Option<SocketAddr>, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
-        Self::add_socket0(&self.inner.tcp_listener_map, local_addr, packet_sender)
+        Self::add_socket0(&self.inner, &self.inner.tcp_listener_map, local_addr, packet_sender)
     }
     pub(crate) fn remove_tcp_listener(&self, local_addr: &Option<SocketAddr>) {
         self.inner.tcp_listener_map.remove(local_addr);
     }
     pub(crate) fn add_tcp_socket(&self, network_tuple: NetworkTuple, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
-        Self::add_socket0(&self.inner.tcp_stream_map, network_tuple, packet_sender)
+        Self::add_socket0(&self.inner, &self.inner.tcp_stream_map, network_tuple, packet_sender)
     }
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
         self.inner.tcp_stream_map.remove(network_tuple);
@@ -369,15 +395,23 @@ impl IpStack {
     pub(crate) fn remove_ip_socket(&self, protocol: Option<IpNextHeaderProtocol>, local_addr: Option<SocketAddr>) {
         self.inner.raw_socket_map.remove(&(protocol, local_addr));
     }
-    fn add_socket0<K: Eq + PartialEq + Hash, V>(map: &DashMap<K, V>, local_addr: K, packet_sender: V) -> io::Result<()> {
+    fn add_socket0<K: Eq + PartialEq + Hash, V>(
+        ip_stack_inner: &IpStackInner,
+        map: &DashMap<K, V>,
+        local_addr: K,
+        packet_sender: V,
+    ) -> io::Result<()> {
+        ip_stack_inner.check_state()?;
         let entry = map.entry(local_addr);
-        match entry {
+        let rs = match entry {
             Entry::Occupied(_entry) => Err(io::Error::from(io::ErrorKind::AddrInUse)),
             Entry::Vacant(entry) => {
                 entry.insert(packet_sender);
                 Ok(())
             }
-        }
+        };
+        ip_stack_inner.check_state_and_remove()?;
+        rs
     }
     pub(crate) async fn send_packet(&self, transport_packet: TransportPacket) -> io::Result<()> {
         match self.inner.packet_sender.send(transport_packet).await {
