@@ -387,7 +387,7 @@ impl AsyncRead for TcpStreamReadHalf {
         }
         let poll = self.payload_receiver.poll_recv(cx);
         match poll {
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof))),
+            Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Ready(Some(mut p)) => {
                 if p.is_empty() {
                     self.payload_receiver.close();
