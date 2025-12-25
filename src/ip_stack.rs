@@ -149,6 +149,22 @@ impl IpStackInner {
         }
         rs
     }
+    pub fn has_tcp_connection(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<bool> {
+        self.check_state()?;
+
+        if local_addr.is_ipv4() != peer_addr.is_ipv4() {
+            return Ok(false);
+        }
+        // Recorded from ingress (accept) perspective:
+        // IP packet direction is peer -> local.
+        let key = NetworkTuple {
+            src: peer_addr,
+            dst: local_addr,
+            protocol: IpNextHeaderProtocols::Tcp,
+        };
+
+        Ok(self.tcp_stream_map.contains_key(&key))
+    }
 }
 /// Send IP packets to the protocol stack using `IpStackSend`
 #[derive(Clone)]
@@ -327,6 +343,10 @@ fn check_timeouts(ident_fragments_map: &Mutex<HashMap<IdKey, IpFragments>>, time
 impl IpStack {
     pub fn routes(&self) -> &SafeRoutes {
         &self.routes
+    }
+    /// Check whether a TCP stream entry exists for the given local/peer socket pair.
+    pub fn has_tcp_connection(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<bool> {
+        self.inner.has_tcp_connection(local_addr, peer_addr)
     }
 }
 impl IpStack {
