@@ -43,7 +43,7 @@ impl TcpReceiveQueue {
             None
         }
     }
-    pub fn peek(&mut self) -> Option<TcpReceiveQueueItem> {
+    pub fn peek(&mut self) -> Option<TcpReceiveQueueItem<'_>> {
         let total_bytes = &mut self.total_bytes;
         self.queue.front_mut().map(|payload| TcpReceiveQueueItem { total_bytes, payload })
     }

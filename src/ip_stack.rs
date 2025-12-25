@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use dashmap::{DashMap, Entry};
+use dashmap::{DashMap, DashSet, Entry};
 use parking_lot::Mutex;
 use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
@@ -120,6 +120,7 @@ pub struct IpStack {
 #[derive(Debug)]
 pub(crate) struct IpStackInner {
     active_state: AtomicBool,
+    pub(crate) tcp_half_open: DashSet<NetworkTuple>,
     pub(crate) tcp_stream_map: DashMap<NetworkTuple, Sender<TransportPacket>>,
     pub(crate) tcp_listener_map: DashMap<Option<SocketAddr>, Sender<TransportPacket>>,
     pub(crate) udp_socket_map: DashMap<(Option<SocketAddr>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
@@ -164,6 +165,19 @@ impl IpStackInner {
         };
 
         Ok(self.tcp_stream_map.contains_key(&key))
+    }
+    pub fn has_tcp_half_open(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<bool> {
+        self.check_state()?;
+        if local_addr.is_ipv4() != peer_addr.is_ipv4() {
+            return Ok(false);
+        }
+        let key = NetworkTuple {
+            src: peer_addr,
+            dst: local_addr,
+            protocol: IpNextHeaderProtocols::Tcp,
+        };
+
+        Ok(self.tcp_half_open.contains(&key))
     }
 }
 /// Send IP packets to the protocol stack using `IpStackSend`
@@ -348,6 +362,9 @@ impl IpStack {
     pub fn has_tcp_connection(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<bool> {
         self.inner.has_tcp_connection(local_addr, peer_addr)
     }
+    pub fn has_tcp_half_open(&self, local_addr: SocketAddr, peer_addr: SocketAddr) -> io::Result<bool> {
+        self.inner.has_tcp_half_open(local_addr, peer_addr)
+    }
 }
 impl IpStack {
     pub(crate) fn new(config: IpStackConfig, packet_sender: Sender<TransportPacket>) -> Self {
@@ -356,6 +373,7 @@ impl IpStack {
             config: Box::new(config),
             inner: Arc::new(IpStackInner {
                 active_state: AtomicBool::new(true),
+                tcp_half_open: Default::default(),
                 tcp_stream_map: Default::default(),
                 tcp_listener_map: Default::default(),
                 udp_socket_map: Default::default(),
@@ -405,6 +423,12 @@ impl IpStack {
     }
     pub(crate) fn add_tcp_socket(&self, network_tuple: NetworkTuple, packet_sender: Sender<TransportPacket>) -> io::Result<()> {
         Self::add_socket0(&self.inner, &self.inner.tcp_stream_map, network_tuple, packet_sender)
+    }
+    pub(crate) fn add_tcp_half_open(&self, network_tuple: NetworkTuple) {
+        self.inner.tcp_half_open.insert(network_tuple);
+    }
+    pub(crate) fn remove_tcp_half_open(&self, network_tuple: &NetworkTuple) {
+        self.inner.tcp_half_open.remove(network_tuple);
     }
     pub(crate) fn remove_tcp_socket(&self, network_tuple: &NetworkTuple) {
         self.inner.tcp_stream_map.remove(network_tuple);

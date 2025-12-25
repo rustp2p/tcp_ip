@@ -162,18 +162,22 @@ impl TcpListener {
                     let tcp_config = self.ip_stack.config.tcp_config;
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
-                        self.ip_stack.send_packet(relay_packet).await?;
+                        self.ip_stack.add_tcp_half_open(*network_tuple);
                         self.tcb_map.insert(*network_tuple, tcb);
+                        self.ip_stack.send_packet(relay_packet).await?;
                         continue;
                     }
                 } else if let Some(tcb) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
                     if tcb.try_syn_received_to_established(packet.buf) {
                         let tcb = self.tcb_map.remove(network_tuple).unwrap();
-                        return Ok((TcpStream::new(self.ip_stack.clone(), tcb)?, peer_addr));
+                        let stream = TcpStream::new(self.ip_stack.clone(), tcb);
+                        self.ip_stack.remove_tcp_half_open(network_tuple);
+                        return Ok((stream?, peer_addr));
                     }
                     if tcb.is_close() {
                         self.tcb_map.remove(network_tuple).unwrap();
+                        self.ip_stack.remove_tcp_half_open(network_tuple);
                     }
                 } else if tcp_packet.get_flags() & RST == RST {
                     continue;
