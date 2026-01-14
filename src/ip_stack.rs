@@ -180,8 +180,8 @@ impl IpStackInner {
         Ok(self.tcp_half_open.contains(&key))
     }
 }
+
 /// Send IP packets to the protocol stack using `IpStackSend`
-#[derive(Clone)]
 pub struct IpStackSend {
     ip_stack: IpStack,
     ident_fragments_map: Arc<Mutex<HashMap<IdKey, IpFragments>>>,
