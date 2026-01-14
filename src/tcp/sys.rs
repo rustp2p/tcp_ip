@@ -143,7 +143,7 @@ impl TcpStreamTask {
                 TaskRecvData::Out(buf) => {
                     self.write(buf).await?;
                 }
-                TaskRecvData::InClose => return Err(Error::new(io::ErrorKind::Other, "NetworkDown")),
+                TaskRecvData::InClose => return Err(Error::other("NetworkDown")),
                 TaskRecvData::OutClose => {
                     assert!(self.last_buffer.is_none());
                     self.write_half_closed = true;

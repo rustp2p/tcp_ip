@@ -140,7 +140,7 @@ impl IpStackInner {
         if self.active_state.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "shutdown"))
+            Err(io::Error::other("shutdown"))
         }
     }
     fn check_state_and_remove(&self) -> io::Result<()> {
@@ -1270,7 +1270,7 @@ impl IpStack {
         if let Some(v) = IP_STACK.lock().clone() {
             Ok(v)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "Not initialized IpStack"))
+            Err(io::Error::other("Not initialized IpStack"))
         }
     }
     pub fn release() {
