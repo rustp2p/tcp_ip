@@ -483,6 +483,27 @@ impl IpStack {
 }
 
 impl IpStackSend {
+    pub async fn send_ipv4_payload(
+        &self,
+        protocol: IpNextHeaderProtocol,
+        src_ip: Ipv4Addr,
+        dest_ip: Ipv4Addr,
+        payload: BytesMut,
+    ) -> io::Result<()> {
+        let network_tuple = convert_ip_payload_network_tuple(protocol, src_ip, dest_ip, &payload)?;
+        let mut sender = match protocol {
+            IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
+            IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
+            _ => None,
+        };
+        if sender.is_none() {
+            sender = self.get_raw_sender(protocol, &network_tuple);
+        }
+        if let Some(sender) = sender {
+            _ = sender.send(TransportPacket::new(payload, network_tuple)).await;
+        }
+        Ok(())
+    }
     /// Send the IP packet to this protocol stack.
     pub async fn send_ip_packet(&self, buf: &[u8]) -> io::Result<()> {
         let p = buf[0] >> 4;
@@ -943,17 +964,26 @@ impl IpFragments {
 }
 
 fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
+    let protocol = packet.get_next_level_protocol();
     let src_ip = packet.get_source();
     let dest_ip = packet.get_destination();
-    let (src_port, dest_port) = match packet.get_next_level_protocol() {
+    convert_ip_payload_network_tuple(protocol, src_ip, dest_ip, packet.payload())
+}
+fn convert_ip_payload_network_tuple(
+    protocol: IpNextHeaderProtocol,
+    src_ip: Ipv4Addr,
+    dest_ip: Ipv4Addr,
+    payload: &[u8],
+) -> io::Result<NetworkTuple> {
+    let (src_port, dest_port) = match protocol {
         IpNextHeaderProtocols::Tcp => {
-            let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(packet.payload()) else {
+            let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(payload) else {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             };
             (tcp_packet.get_source(), tcp_packet.get_destination())
         }
         IpNextHeaderProtocols::Udp => {
-            let Some(udp_packet) = pnet_packet::udp::UdpPacket::new(packet.payload()) else {
+            let Some(udp_packet) = pnet_packet::udp::UdpPacket::new(payload) else {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             };
             (udp_packet.get_source(), udp_packet.get_destination())
@@ -963,7 +993,6 @@ fn convert_network_tuple(packet: &Ipv4Packet) -> io::Result<NetworkTuple> {
 
     let src_addr = SocketAddrV4::new(src_ip, src_port);
     let dest_addr = SocketAddrV4::new(dest_ip, dest_port);
-    let protocol = packet.get_next_level_protocol();
     let network_tuple = NetworkTuple::new(src_addr.into(), dest_addr.into(), protocol);
     Ok(network_tuple)
 }
