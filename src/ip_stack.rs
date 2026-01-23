@@ -32,6 +32,37 @@ pub(crate) const fn default_ip(is_v4: bool) -> IpAddr {
         UNSPECIFIED_ADDR_V6.ip()
     }
 }
+pub(crate) fn validate_addr(dest: SocketAddr) -> io::Result<()> {
+    if dest.port() == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port"));
+    }
+    validate_ip(dest.ip())?;
+    Ok(())
+}
+pub(crate) fn validate_ip(ip: IpAddr) -> io::Result<()> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("IP is unspecified: {}", ip)));
+            }
+            if v4.is_multicast() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("IP is multicast: {}", ip)));
+            }
+            if v4.is_broadcast() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("IP is broadcast: {}", ip)));
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("IP is unspecified: {}", ip)));
+            }
+            if v6.is_multicast() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("IP is multicast: {}", ip)));
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn check_addr(addr: SocketAddr) -> io::Result<()> {
     if addr.port() == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid port"));

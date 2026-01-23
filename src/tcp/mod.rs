@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Error;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -15,7 +15,7 @@ use tokio_util::sync::PollSender;
 pub use tcb::TcpConfig;
 
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, check_ip, default_addr, BindAddr, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_addr, check_ip, default_addr, validate_addr, BindAddr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 
@@ -228,7 +228,7 @@ impl TcpStream {
 impl TcpStream {
     pub async fn connect_to<A: ToSocketAddr>(self, dest: A) -> io::Result<Self> {
         let dest = dest.to_addr()?;
-        check_addr(dest)?;
+        validate_addr(dest)?;
         let Some(ip_stack) = self.ip_stack else {
             return Err(Error::new(io::ErrorKind::AlreadyExists, "transport endpoint is already connected"));
         };
@@ -242,6 +242,13 @@ impl TcpStream {
             } else {
                 Err(e)?
             }
+        }
+        validate_addr(src)?;
+        if src == dest {
+            return Err(Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid self-connect: source and destination are identical ({src})"),
+            ));
         }
 
         Self::connect0(self.bind_addr, ip_stack, src, dest).await
