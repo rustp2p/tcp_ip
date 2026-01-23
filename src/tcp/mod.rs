@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Error;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -15,7 +15,7 @@ use tokio_util::sync::PollSender;
 pub use tcb::TcpConfig;
 
 use crate::address::ToSocketAddr;
-use crate::ip_stack::{check_addr, check_ip, default_addr, validate_addr, BindAddr, IpStack, NetworkTuple, TransportPacket};
+use crate::ip_stack::{check_ip, default_addr, validate_addr, BindAddr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 
