@@ -310,15 +310,16 @@ impl IdKey {
 /// Create a user-space protocol stack.
 ///
 /// # Examples
-/// ```rust
+/// ```no_run
 /// use tcp_ip::tcp::TcpListener;
 /// #[cfg(not(feature = "global-ip-stack"))]
-/// async fn main(){
+/// async fn example() -> std::io::Result<()> {
 ///     let (ip_stack, ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
 ///     // Use ip_stack_send and ip_stack_recv to interface
 ///     // with the input and output of IP packets.
 ///     // ...
 ///     let mut tcp_listener = TcpListener::bind_all(ip_stack.clone()).await?;
+///     Ok(())
 /// }
 /// ```
 #[cfg(not(feature = "global-ip-stack"))]
@@ -329,15 +330,16 @@ pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpSt
 /// Create a user-space protocol stack.
 ///
 /// # Examples
-/// ```rust
+/// ```no_run
 /// use tcp_ip::tcp::TcpListener;
 /// #[cfg(feature = "global-ip-stack")]
-/// async fn main(){
+/// async fn example() -> std::io::Result<()> {
 ///     let (ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
 ///     // Use ip_stack_send and ip_stack_recv to interface
 ///     // with the input and output of IP packets.
 ///     // ...
 ///     let mut tcp_listener = TcpListener::bind_all().await?;
+///     Ok(())
 /// }
 /// ```
 #[cfg(feature = "global-ip-stack")]

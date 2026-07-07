@@ -21,7 +21,7 @@ pub async fn main() -> std::io::Result<()> {
             todo!("Receive IP packets from the protocol stack using 'ip_stack_recv'")
         }
     });
-    let mut tcp_listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(), "0.0.0.0:80".parse().unwrap()).await?;
+    let mut tcp_listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(), "0.0.0.0:80".parse::<std::net::SocketAddr>().unwrap()).await?;
     loop {
         let (mut tcp_stream, addr) = tcp_listener.accept().await?;
         tokio::spawn(async move {
