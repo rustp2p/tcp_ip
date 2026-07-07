@@ -4,7 +4,10 @@
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
+    #[cfg(not(feature = "global-ip-stack"))]
     let (ip_stack, _ip_stack_send, mut ip_stack_recv) = tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
+    #[cfg(feature = "global-ip-stack")]
+    let (_ip_stack_send, mut ip_stack_recv) = tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
     tokio::spawn(async move {
         loop {
             // ip_stack_send.send_ip_packet()
@@ -21,7 +24,10 @@ pub async fn main() -> std::io::Result<()> {
             todo!("Receive IP packets from the protocol stack using 'ip_stack_recv'")
         }
     });
-    let mut tcp_listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(), "0.0.0.0:80".parse().unwrap()).await?;
+    #[cfg(not(feature = "global-ip-stack"))]
+    let mut tcp_listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(), "0.0.0.0:80".parse::<std::net::SocketAddr>().unwrap()).await?;
+    #[cfg(feature = "global-ip-stack")]
+    let mut tcp_listener = tcp_ip::tcp::TcpListener::bind("0.0.0.0:80".parse::<std::net::SocketAddr>().unwrap()).await?;
     loop {
         let (mut tcp_stream, addr) = tcp_listener.accept().await?;
         tokio::spawn(async move {

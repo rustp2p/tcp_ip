@@ -310,15 +310,16 @@ impl IdKey {
 /// Create a user-space protocol stack.
 ///
 /// # Examples
-/// ```rust
+/// ```no_run
 /// use tcp_ip::tcp::TcpListener;
 /// #[cfg(not(feature = "global-ip-stack"))]
-/// async fn main(){
+/// async fn example() -> std::io::Result<()> {
 ///     let (ip_stack, ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
 ///     // Use ip_stack_send and ip_stack_recv to interface
 ///     // with the input and output of IP packets.
 ///     // ...
 ///     let mut tcp_listener = TcpListener::bind_all(ip_stack.clone()).await?;
+///     Ok(())
 /// }
 /// ```
 #[cfg(not(feature = "global-ip-stack"))]
@@ -329,15 +330,16 @@ pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpSt
 /// Create a user-space protocol stack.
 ///
 /// # Examples
-/// ```rust
+/// ```no_run
 /// use tcp_ip::tcp::TcpListener;
 /// #[cfg(feature = "global-ip-stack")]
-/// async fn main(){
+/// async fn example() -> std::io::Result<()> {
 ///     let (ip_stack_send, ip_stack_recv) = tcp_ip::ip_stack(Default::default())?;
 ///     // Use ip_stack_send and ip_stack_recv to interface
 ///     // with the input and output of IP packets.
 ///     // ...
 ///     let mut tcp_listener = TcpListener::bind_all().await?;
+///     Ok(())
 /// }
 /// ```
 #[cfg(feature = "global-ip-stack")]
@@ -733,9 +735,7 @@ impl IpStackSend {
         if ip_fragments.is_complete() {
             //This place cannot be None
             let mut fragments = map.remove(&id_key).unwrap();
-            fragments
-                .bufs
-                .sort_by(|ip_fragment1, ip_fragment2| ip_fragment1.offset.cmp(&ip_fragment2.offset));
+            fragments.bufs.sort_by_key(|ip_fragment1| ip_fragment1.offset);
             let mut total_payload_len = 0;
             for ip_fragment in &fragments.bufs {
                 if total_payload_len as u16 != ip_fragment.offset {
@@ -1204,7 +1204,7 @@ impl Routes {
             }
         }
         self.v4_table.push((dest, mask, ip));
-        self.v4_table.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v4_table.sort_by_key(|b| std::cmp::Reverse(b.1));
         Ok(())
     }
     fn add_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr, ip: Ipv6Addr) -> io::Result<()> {
@@ -1223,7 +1223,7 @@ impl Routes {
             }
         }
         self.v6_table.push((dest, mask, ip));
-        self.v6_table.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v6_table.sort_by_key(|b| std::cmp::Reverse(b.1));
         Ok(())
     }
     fn remove_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) -> io::Result<()> {

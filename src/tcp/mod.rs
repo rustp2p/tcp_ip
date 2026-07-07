@@ -34,17 +34,29 @@ mod tcp_queue;
 /// }
 ///
 /// #[tokio::main]
-/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> io::Result<()> {
-///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
-///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
-///     let src = "10.0.0.2:8080".parse().unwrap();
-///     let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
+///     #[cfg(not(feature = "global-ip-stack"))]
+///     {
+///         let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///                 tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
+///         // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
 ///
-///     loop {
-///         let (socket, _) = listener.accept().await?;
-///         process_socket(socket).await;
+///         loop {
+///             let (socket, _) = listener.accept().await?;
+///             process_socket(socket).await;
+///         }
+///     }
+///     #[cfg(feature = "global-ip-stack")]
+///     {
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let mut listener = tcp_ip::tcp::TcpListener::bind(src).await?;
+///
+///         loop {
+///             let (socket, _) = listener.accept().await?;
+///             process_socket(socket).await;
+///         }
 ///     }
 /// }
 /// ```
@@ -61,20 +73,32 @@ pub struct TcpListener {
 /// # Example
 /// ```no_run
 /// #[tokio::main]
-/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> std::io::Result<()> {
 ///     // Connect to a peer
 ///     use tokio::io::AsyncWriteExt;
-///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
-///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
-///     let src = "10.0.0.2:8080".parse().unwrap();
-///     let dst = "10.0.0.3:8080".parse().unwrap();
-///     let mut stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(),src)?
-///             .connect(dst).await?;
+///     #[cfg(not(feature = "global-ip-stack"))]
+///     {
+///         let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///                 tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
+///         // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let dst: std::net::SocketAddr = "10.0.0.3:8080".parse().unwrap();
+///         let mut stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(),src)?
+///                 .connect_to(dst).await?;
 ///
-///     // Write some data.
-///     stream.write_all(b"hello world!").await?;
+///         // Write some data.
+///         stream.write_all(b"hello world!").await?;
+///     }
+///     #[cfg(feature = "global-ip-stack")]
+///     {
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let dst: std::net::SocketAddr = "10.0.0.3:8080".parse().unwrap();
+///         let mut stream = tcp_ip::tcp::TcpStream::bind(src)?
+///                 .connect_to(dst).await?;
+///
+///         // Write some data.
+///         stream.write_all(b"hello world!").await?;
+///     }
 ///
 ///     Ok(())
 /// }
@@ -159,7 +183,10 @@ impl TcpListener {
                 let peer_addr = network_tuple.src;
                 if tcp_packet.get_flags() & SYN == SYN {
                     // LISTEN -> SYN_RECEIVED
-                    let tcp_config = self.ip_stack.config.tcp_config;
+                    let mut tcp_config = self.ip_stack.config.tcp_config;
+                    if tcp_config.mss.is_none() {
+                        tcp_config.mss.replace(self.ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
+                    }
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
                         self.ip_stack.add_tcp_half_open(*network_tuple);
@@ -301,7 +328,7 @@ impl TcpStream {
         if tcp_config.mss.is_none() {
             tcp_config.mss.replace(ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
         }
-        let tcb = Tcb::new_listen(local_addr, peer_addr, ip_stack.config.tcp_config);
+        let tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
         let mut stream_task = TcpStreamTask::new(bind_addr, tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
         stream_task.connect().await?;
         let read_notify = stream_task.read_notify();

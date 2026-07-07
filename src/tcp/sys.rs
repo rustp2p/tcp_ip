@@ -101,7 +101,14 @@ impl TcpStreamTask {
             if self.tcb.is_close() {
                 return Ok(());
             }
-            if self.quick_end && self.read_half_closed() && self.write_half_closed {
+            if self.quick_end
+                && self.read_half_closed()
+                && self.write_half_closed
+                && self.tcb.no_inflight_packet()
+                && self.tcb.fin_acknowledged()
+            {
+                // Both halves are closed and the peer has acknowledged everything:
+                // it is safe to skip the remaining teardown states
                 return Ok(());
             }
             if !self.write_half_closed && !self.retransmission {
@@ -152,15 +159,24 @@ impl TcpStreamTask {
                     self.tcb.sent_fin();
                 }
                 TaskRecvData::Timeout => {
+                    // Closing from TIME_WAIT is a normal end of the connection,
+                    // anything else reaching Closed here is a retransmission give-up
+                    let normal_close = self.tcb.time_wait().is_some();
                     self.tcb.timeout();
                     if self.tcb.is_close() {
-                        return Ok(());
+                        return if normal_close {
+                            Ok(())
+                        } else {
+                            Err(Error::new(io::ErrorKind::TimedOut, "retransmission timed out"))
+                        };
                     }
                     if self.tcb.cannot_write() {
                         let packet = self.tcb.fin_packet();
                         self.send_packet(packet).await?;
                     }
-                    if self.read_half_closed() && self.write_half_closed {
+                    if self.read_half_closed() && self.write_half_closed && self.tcb.no_inflight_packet() && self.tcb.fin_acknowledged() {
+                        // Unacknowledged data or FIN must keep being retransmitted;
+                        // the give-up counter in `Tcb::timeout` bounds this
                         return Ok(());
                     }
                 }
@@ -213,8 +229,10 @@ impl TcpStreamTask {
                         }
                     },
                 }
-                self.read_notify.set_state(self.tcb.readable());
             }
+            // Must also be updated when the loop exits early (channel full),
+            // otherwise the remaining data would never wake this task again
+            self.read_notify.set_state(self.tcb.readable());
             if self.tcb.cannot_read() || read_half_closed {
                 self.close_read();
             }
@@ -310,6 +328,12 @@ impl TcpStreamTask {
         } else if self.write_half_closed {
             let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config.time_wait_timeout);
             self.recv_in_timeout_at(timeout_at).await
+        } else if self.only_recv_in() {
+            // Sending cannot make progress (e.g. the peer advertised a zero window
+            // and nothing is inflight). Stop draining the application layer so that
+            // `last_buffer` is not overwritten, and wake up periodically to retry
+            // flushing, acting as a simple zero-window probe timer.
+            self.recv_in_timeout(self.ip_stack.config.tcp_config.retransmission_timeout).await
         } else {
             self.recv().await
         }
