@@ -735,9 +735,7 @@ impl IpStackSend {
         if ip_fragments.is_complete() {
             //This place cannot be None
             let mut fragments = map.remove(&id_key).unwrap();
-            fragments
-                .bufs
-                .sort_by_key(|ip_fragment1| ip_fragment1.offset);
+            fragments.bufs.sort_by_key(|ip_fragment1| ip_fragment1.offset);
             let mut total_payload_len = 0;
             for ip_fragment in &fragments.bufs {
                 if total_payload_len as u16 != ip_fragment.offset {
