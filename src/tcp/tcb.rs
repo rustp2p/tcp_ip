@@ -383,6 +383,7 @@ impl Tcb {
         let packet = TcpPacket::new(&buf)?;
         let flags = packet.get_flags();
         if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
+            self.option(&packet);
             self.snd_seq.add_update(1);
             self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
             self.last_snd_ack = self.snd_ack;
@@ -441,7 +442,10 @@ impl Tcb {
                 }
                 TcpOptionNumbers::MSS => {
                     if payload.len() == 2 {
-                        self.mss = ((payload[0] as u16) << 8) | (payload[1] as u16);
+                        // The effective MSS is the minimum of what both sides can handle,
+                        // with a floor to protect against bogus tiny values
+                        let peer_mss = ((payload[0] as u16) << 8) | (payload[1] as u16);
+                        self.mss = self.mss.min(peer_mss.max(64));
                     }
                 }
                 TcpOptionNumbers::SACK_PERMITTED => {
@@ -464,15 +468,17 @@ impl Tcb {
                 }
                 let n = payload.len() >> 3;
                 for inflight_packet in self.inflight_packets.iter_mut() {
+                    if inflight_packet.confirmed {
+                        continue;
+                    }
+                    // SACK blocks are not ordered, so every block must be checked
                     for index in 0..n {
                         let offset = index * 8;
                         let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
                         let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                        if inflight_packet.confirmed || inflight_packet.end() <= left {
-                            break;
-                        }
                         if inflight_packet.start() >= left && inflight_packet.end() <= right {
                             inflight_packet.confirmed = true;
+                            break;
                         }
                     }
                 }
@@ -522,11 +528,17 @@ impl Tcb {
         };
         let flags = packet.get_flags();
         if flags & RST == RST {
-            self.recv_rst();
+            // RFC 5961: only accept a RST whose sequence number falls inside the
+            // receive window, otherwise a stale packet could tear the connection down
+            if self.rst_acceptable(&packet) {
+                self.recv_rst();
+            }
             return None;
         }
         if flags & SYN == SYN {
-            let reply_packet = self.create_transport_packet(RST, &[]);
+            // A delayed duplicate SYN must not reset a synchronized connection;
+            // reply with a challenge ACK instead (RFC 5961)
+            let reply_packet = self.create_transport_packet(ACK, &[]);
             return Some(reply_packet);
         }
 
@@ -536,9 +548,11 @@ impl Tcb {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
                     if acknowledgement == self.rcv_ack {
-                        if self.rcv_ack != self.snd_seq {
+                        // Only a pure ACK carrying no data counts as a duplicate ACK
+                        if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN {
                             self.duplicate_ack_count += 1;
                             if self.duplicate_ack_count > 3 {
+                                self.duplicate_ack_count = 0;
                                 self.back_n();
                             }
                         }
@@ -552,7 +566,16 @@ impl Tcb {
                 buf.advance(header_len);
                 let unread_packet = UnreadPacket::new(seq, flags, buf);
                 if self.rcv_wnd == 0 {
-                    self.snd_ack = unread_packet.end();
+                    // The read half has been dropped: discard the data but keep
+                    // advancing the ACK and handle FIN so the connection can still
+                    // be closed normally
+                    if unread_packet.end() > self.snd_ack {
+                        self.snd_ack = unread_packet.end();
+                    }
+                    if flags & FIN == FIN {
+                        self.recv_fin();
+                    }
+                    return None;
                 }
                 if self.recv_buffer_full() {
                     // Packet loss occurs when the buffer is full
@@ -560,6 +583,10 @@ impl Tcb {
                 }
                 if unread_packet.end() >= self.snd_ack {
                     self.recv(unread_packet);
+                } else if unread_packet.len() > 0 {
+                    // A fully stale duplicate segment means the peer has probably
+                    // lost our ACK, it must be resent (RFC 793)
+                    self.requires_ack_repeat = true;
                 }
                 return None;
             }
@@ -587,6 +614,11 @@ impl Tcb {
         let reply_packet = self.create_transport_packet(RST, &[]);
         Some(reply_packet)
     }
+    fn rst_acceptable(&self, packet: &TcpPacket<'_>) -> bool {
+        let seq = SeqNum(packet.get_sequence());
+        let wnd = (self.recv_window() as u32) << self.rcv_window_shift_cnt;
+        seq >= self.snd_ack && seq <= self.snd_ack.add_num(wnd)
+    }
     pub fn readable(&self) -> bool {
         self.tcp_receive_queue.total_bytes() != 0
     }
@@ -606,7 +638,14 @@ impl Tcb {
             if end > self.snd_ack {
                 unread_packet.advance((self.snd_ack - start).0 as usize);
                 self.snd_ack = end;
-                self.tcp_receive_queue.push(unread_packet.into_bytes())
+                self.tcp_receive_queue.push(unread_packet.into_bytes());
+                // This segment may have filled the gap before the buffered
+                // out-of-order segments, deliver them as well
+                self.advice_ack();
+            } else if unread_packet.len() > 0 {
+                // A fully duplicated segment means the peer has probably lost
+                // our ACK, it must be resent (RFC 793)
+                self.requires_ack_repeat = true;
             }
             if flags & FIN == FIN {
                 self.recv_fin();
@@ -815,6 +854,10 @@ impl Tcb {
     pub fn is_close(&self) -> bool {
         self.state == TcpState::Closed
     }
+    /// Whether the FIN sent by this side has been acknowledged by the peer
+    pub fn fin_acknowledged(&self) -> bool {
+        matches!(self.state, TcpState::FinWait2 | TcpState::TimeWait | TcpState::Closed)
+    }
     pub fn time_wait(&self) -> Option<Instant> {
         self.time_wait
     }
@@ -824,7 +867,12 @@ impl Tcb {
             return;
         }
         if !self.back_n() {
-            return;
+            // Nothing inflight: the give-up counter must still run while an
+            // unacknowledged FIN is being retransmitted
+            let awaiting_fin_ack = matches!(self.state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck);
+            if !awaiting_fin_ack {
+                return;
+            }
         }
         if self.timeout_count.0 == self.rcv_ack {
             self.timeout_count.1 += 1;
@@ -997,9 +1045,11 @@ impl CongestionWindow {
 
     pub fn on_ack(&mut self) {
         if self.cwnd < self.ssthresh {
-            self.cwnd *= 2;
+            // Slow start: one MSS per ACK, doubling the window every RTT
+            self.cwnd += self.mss;
         } else {
-            self.cwnd += (self.cwnd as f64).sqrt() as usize;
+            // Congestion avoidance: about one MSS per RTT
+            self.cwnd += (self.mss * self.mss / self.cwnd).max(1);
         }
 
         self.cwnd = self.cwnd.min(self.max_cwnd);

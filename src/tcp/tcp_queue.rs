@@ -72,7 +72,11 @@ impl TcpOfoQueue {
     }
     pub fn push(&mut self, elt: UnreadPacket) {
         self.total_bytes += elt.len();
-        self.queue.push(elt, handle_duplicate_seq);
+        if let Some(dropped) = self.queue.push(elt, handle_duplicate_seq) {
+            // A duplicate seq was rejected or replaced,
+            // its bytes must not be counted
+            self.total_bytes -= dropped.len();
+        }
     }
     pub fn pop(&mut self) -> Option<UnreadPacket> {
         if let Some(v) = self.queue.pop() {
@@ -134,7 +138,11 @@ impl<T> Default for OrderQueue<T> {
     }
 }
 impl<T: Ord> OrderQueue<T> {
-    pub fn push<F>(&mut self, elt: T, compute: F)
+    /// Insert `elt` keeping the queue ordered.
+    /// When an element with an equal key already exists, `compute(curr, new)` decides
+    /// whether the new element replaces the current one.
+    /// Returns the element that was dropped (the rejected new one or the replaced old one), if any.
+    pub fn push<F>(&mut self, elt: T, compute: F) -> Option<T>
     where
         F: Fn(&T, &T) -> bool,
     {
@@ -145,10 +153,11 @@ impl<T: Ord> OrderQueue<T> {
                 match curr_elt.cmp(&elt) {
                     Ordering::Less => break,
                     Ordering::Equal => {
-                        if compute(curr_elt, &elt) {
-                            v.as_mut().element = elt;
-                        }
-                        return;
+                        return if compute(curr_elt, &elt) {
+                            Some(mem::replace(&mut v.as_mut().element, elt))
+                        } else {
+                            Some(elt)
+                        };
                     }
                     Ordering::Greater => {
                         prev = v.as_ref().prev;
@@ -184,6 +193,7 @@ impl<T: Ord> OrderQueue<T> {
         }
 
         self.len += 1;
+        None
     }
 }
 
@@ -346,13 +356,15 @@ mod tests {
     fn test_push_with_duplicate_handling() {
         let mut queue = OrderQueue::new();
 
-        queue.push(10, |_, _| false);
-        queue.push(10, |_, _| false);
+        assert_eq!(queue.push(10, |_, _| false), None);
+        // The new duplicate is rejected and returned
+        assert_eq!(queue.push(10, |_, _| false), Some(10));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.peek(), Some(&10));
         assert_eq!(queue.len(), 1);
 
-        queue.push(10, |_, _| true);
+        // The old element is replaced and returned
+        assert_eq!(queue.push(10, |_, _| true), Some(10));
         assert_eq!(queue.peek(), Some(&10));
         assert_eq!(queue.len(), 1);
     }
