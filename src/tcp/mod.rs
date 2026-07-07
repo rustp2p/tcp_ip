@@ -34,17 +34,29 @@ mod tcp_queue;
 /// }
 ///
 /// #[tokio::main]
-/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> io::Result<()> {
-///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
-///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
-///     let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
-///     let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
+///     #[cfg(not(feature = "global-ip-stack"))]
+///     {
+///         let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///                 tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
+///         // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let mut listener = tcp_ip::tcp::TcpListener::bind(ip_stack.clone(),src).await?;
 ///
-///     loop {
-///         let (socket, _) = listener.accept().await?;
-///         process_socket(socket).await;
+///         loop {
+///             let (socket, _) = listener.accept().await?;
+///             process_socket(socket).await;
+///         }
+///     }
+///     #[cfg(feature = "global-ip-stack")]
+///     {
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let mut listener = tcp_ip::tcp::TcpListener::bind(src).await?;
+///
+///         loop {
+///             let (socket, _) = listener.accept().await?;
+///             process_socket(socket).await;
+///         }
 ///     }
 /// }
 /// ```
@@ -61,20 +73,32 @@ pub struct TcpListener {
 /// # Example
 /// ```no_run
 /// #[tokio::main]
-/// #[cfg(not(feature = "global-ip-stack"))]
 /// async fn main() -> std::io::Result<()> {
 ///     // Connect to a peer
 ///     use tokio::io::AsyncWriteExt;
-///     let (ip_stack, _ip_stack_send, _ip_stack_recv) =
-///             tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
-///     // Read and write IP packets using _ip_stack_send and _ip_stack_recv
-///     let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
-///     let dst: std::net::SocketAddr = "10.0.0.3:8080".parse().unwrap();
-///     let mut stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(),src)?
-///             .connect_to(dst).await?;
+///     #[cfg(not(feature = "global-ip-stack"))]
+///     {
+///         let (ip_stack, _ip_stack_send, _ip_stack_recv) =
+///                 tcp_ip::ip_stack(tcp_ip::IpStackConfig::default())?;
+///         // Read and write IP packets using _ip_stack_send and _ip_stack_recv
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let dst: std::net::SocketAddr = "10.0.0.3:8080".parse().unwrap();
+///         let mut stream = tcp_ip::tcp::TcpStream::bind(ip_stack.clone(),src)?
+///                 .connect_to(dst).await?;
 ///
-///     // Write some data.
-///     stream.write_all(b"hello world!").await?;
+///         // Write some data.
+///         stream.write_all(b"hello world!").await?;
+///     }
+///     #[cfg(feature = "global-ip-stack")]
+///     {
+///         let src: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+///         let dst: std::net::SocketAddr = "10.0.0.3:8080".parse().unwrap();
+///         let mut stream = tcp_ip::tcp::TcpStream::bind(src)?
+///                 .connect_to(dst).await?;
+///
+///         // Write some data.
+///         stream.write_all(b"hello world!").await?;
+///     }
 ///
 ///     Ok(())
 /// }
