@@ -79,6 +79,9 @@ pub struct Tcb {
     time_wait_timeout: Duration,
     write_timeout: Option<Instant>,
     retransmission_timeout: Duration,
+    srtt: Option<Duration>,
+    rttvar: Duration,
+    rto: Duration,
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
     last_snd_wnd: u16,
@@ -205,6 +208,8 @@ struct InflightPacket {
     seq: SeqNum,
     // Need to support SACK
     confirmed: bool,
+    sent_at: Instant,
+    retransmitted: bool,
     buf: FixedBuffer,
 }
 
@@ -213,6 +218,8 @@ impl InflightPacket {
         let mut packet = Self {
             seq,
             confirmed: false,
+            sent_at: Instant::now(),
+            retransmitted: false,
             buf,
         };
         packet.init();
@@ -257,7 +264,7 @@ impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             retransmission_timeout: Duration::from_millis(1000),
-            time_wait_timeout: Duration::from_secs(10),
+            time_wait_timeout: Duration::from_secs(60),
             mss: None,
             rcv_wnd: u16::MAX,
             // Window size too large can cause packet loss
@@ -311,6 +318,9 @@ impl Tcb {
             time_wait_timeout: config.time_wait_timeout,
             write_timeout: None,
             retransmission_timeout: config.retransmission_timeout,
+            srtt: None,
+            rttvar: config.retransmission_timeout / 2,
+            rto: config.retransmission_timeout,
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
             last_snd_wnd: 0,
@@ -354,7 +364,9 @@ impl Tcb {
         };
         let flags = packet.get_flags();
         if flags & RST == RST {
-            self.recv_rst();
+            if self.rst_acceptable(&packet) {
+                self.recv_rst();
+            }
             return false;
         }
         let header_len = packet.get_data_offset() as usize * 4;
@@ -382,6 +394,12 @@ impl Tcb {
     pub fn try_syn_sent_to_established(&mut self, buf: BytesMut) -> Option<TransportPacket> {
         let packet = TcpPacket::new(&buf)?;
         let flags = packet.get_flags();
+        if self.state == TcpState::SynSent && flags & RST == RST {
+            if flags & ACK == ACK && packet.get_acknowledgement() == self.snd_seq.add_num(1).0 {
+                self.recv_rst();
+            }
+            return None;
+        }
         if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
             self.option(&packet);
             self.snd_seq.add_update(1);
@@ -547,13 +565,16 @@ impl Tcb {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
+                    let wnd_unchanged = packet.get_window() == self.snd_wnd;
                     if acknowledgement == self.rcv_ack {
                         // Only a pure ACK carrying no data counts as a duplicate ACK
-                        if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN {
+                        if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN && wnd_unchanged {
                             self.duplicate_ack_count += 1;
                             if self.duplicate_ack_count > 3 {
                                 self.duplicate_ack_count = 0;
-                                self.back_n();
+                                if self.back_n() {
+                                    self.congestion_window.on_fast_retransmit();
+                                }
                             }
                         }
                         self.snd_wnd = packet.get_window();
@@ -579,6 +600,7 @@ impl Tcb {
                 }
                 if self.recv_buffer_full() {
                     // Packet loss occurs when the buffer is full
+                    self.requires_ack_repeat = true;
                     return None;
                 }
                 if unread_packet.end() >= self.snd_ack {
@@ -593,8 +615,8 @@ impl Tcb {
             TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
-                    if acknowledgement > self.snd_seq {
-                        // acknowledgement == self.snd_seq + 1
+                    self.update_last_ack(&packet);
+                    if acknowledgement == self.snd_seq.add_num(1) {
                         self.recv_fin_ack()
                     }
                 }
@@ -614,7 +636,7 @@ impl Tcb {
         let reply_packet = self.create_transport_packet(RST, &[]);
         Some(reply_packet)
     }
-    fn rst_acceptable(&self, packet: &TcpPacket<'_>) -> bool {
+    pub(crate) fn rst_acceptable(&self, packet: &TcpPacket<'_>) -> bool {
         let seq = SeqNum(packet.get_sequence());
         let wnd = (self.recv_window() as u32) << self.rcv_window_shift_cnt;
         if wnd == 0 {
@@ -700,15 +722,6 @@ impl Tcb {
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
-    // pub fn recv_busy(&self) -> bool {
-    //     if !self.readable_state() || self.rcv_wnd == 0 {
-    //         return false;
-    //     }
-    //     let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
-    //     let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
-    //     let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
-    //     rcv_wnd <= 2 * self.mss as usize
-    // }
 }
 
 /// Implementation related to writing data
@@ -732,6 +745,19 @@ impl Tcb {
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
         let ack = AckNum::from(tcp_packet.get_acknowledgement());
+        let max_ack = if matches!(
+            self.state,
+            TcpState::FinWait1 | TcpState::FinWait2 | TcpState::Closing | TcpState::LastAck
+        ) {
+            self.snd_seq.add_num(1)
+        } else {
+            self.snd_seq
+        };
+        if ack > max_ack {
+            self.requires_ack_repeat = true;
+            return;
+        }
+        self.note_peer_activity();
         if ack <= self.rcv_ack {
             return;
         }
@@ -740,24 +766,59 @@ impl Tcb {
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
         self.rcv_ack = ack;
+        let now = Instant::now();
+        let mut rtt_candidate_seen = false;
         while let Some(inflight_packet) = self.inflight_packets.front_mut() {
             if inflight_packet.len() > distance {
                 inflight_packet.advance(distance);
                 break;
             } else {
                 distance -= inflight_packet.len();
-                _ = self.inflight_packets.pop_front();
+                if let Some(inflight_packet) = self.inflight_packets.pop_front() {
+                    if !rtt_candidate_seen && !inflight_packet.retransmitted {
+                        self.sample_rtt(now.saturating_duration_since(inflight_packet.sent_at));
+                    }
+                    rtt_candidate_seen = true;
+                }
             }
         }
         if self.inflight_packets.is_empty() {
             self.write_timeout.take();
-        } else if let Some(write_timeout) = self.write_timeout.as_mut() {
-            *write_timeout += self.retransmission_timeout
+        } else {
+            self.reset_write_timeout();
         }
         if !self.writeable_state() && self.rcv_ack > self.snd_seq {
             self.recv_fin_ack()
         }
         self.reset_write_timeout();
+    }
+    fn note_peer_activity(&mut self) {
+        self.timeout_count.0 = self.rcv_ack;
+        self.timeout_count.1 = 0;
+    }
+    fn min_rto(&self) -> Duration {
+        self.retransmission_timeout.min(Duration::from_millis(200))
+    }
+    fn clamp_rto(&self, rto: Duration) -> Duration {
+        rto.clamp(self.min_rto(), Duration::from_secs(60))
+    }
+    fn sample_rtt(&mut self, rtt: Duration) {
+        if rtt.is_zero() {
+            return;
+        }
+        if let Some(srtt) = self.srtt {
+            let diff = srtt.abs_diff(rtt);
+            self.rttvar = (self.rttvar * 3 + diff) / 4;
+            self.srtt = Some((srtt * 7 + rtt) / 8);
+        } else {
+            self.srtt = Some(rtt);
+            self.rttvar = rtt / 2;
+        }
+        let srtt = self.srtt.unwrap();
+        self.rto = self.clamp_rto(srtt + (self.rttvar * 4).max(Duration::from_millis(10)));
+    }
+    fn backoff_rto(&mut self) {
+        self.rto = self.clamp_rto(self.rto * 2);
     }
     fn take_send_buf(&mut self) -> Option<InflightPacket> {
         let bytes_mut = FixedBuffer::with_capacity(self.mss as usize);
@@ -767,6 +828,23 @@ impl Tcb {
         let rs = self.write0(buf);
         self.init_write_timeout();
         rs
+    }
+    pub fn write_probe(&mut self, buf: &[u8]) -> Option<(TransportPacket, usize)> {
+        if !self.writeable_state() || buf.is_empty() {
+            return None;
+        }
+        let seq = self.snd_seq.0;
+        let buf = &buf[..1];
+        let mut packet = self.take_send_buf()?;
+        let n = packet.write(buf);
+        if n == 0 {
+            return None;
+        }
+        self.inflight_packets.push_back(packet);
+        let packet = self.create_transport_packet_seq(ACK, seq, &buf[..n]);
+        self.snd_seq.add_update(n as u32);
+        self.init_write_timeout();
+        Some((packet, n))
     }
     fn write0(&mut self, mut buf: &[u8]) -> Option<(TransportPacket, usize)> {
         if !self.writeable_state() {
@@ -803,9 +881,12 @@ impl Tcb {
     pub fn write_timeout(&self) -> Option<Instant> {
         self.write_timeout
     }
+    pub fn rto(&self) -> Duration {
+        self.rto
+    }
     fn reset_write_timeout(&mut self) {
         if !self.inflight_packets.is_empty() {
-            self.write_timeout.replace(Instant::now() + self.retransmission_timeout);
+            self.write_timeout.replace(Instant::now() + self.rto);
         }
     }
     fn init_write_timeout(&mut self) {
@@ -816,13 +897,18 @@ impl Tcb {
 
     pub fn retransmission(&mut self) -> Option<TransportPacket> {
         let back_seq = self.back_seq?;
-        for packet in self.inflight_packets.iter() {
+        for packet in self.inflight_packets.iter_mut() {
             if packet.confirmed {
                 continue;
             }
             if packet.end() > back_seq {
-                self.back_seq.replace(packet.end());
-                return Some(self.create_transport_packet_seq(ACK, packet.start().0, packet.bytes()));
+                let next_back_seq = packet.end();
+                let seq = packet.start().0;
+                let bytes = BytesMut::from(packet.bytes());
+                packet.retransmitted = true;
+                packet.sent_at = Instant::now();
+                self.back_seq.replace(next_back_seq);
+                return Some(self.create_transport_packet_seq(ACK, seq, &bytes));
             }
         }
         self.back_seq.take();
@@ -831,7 +917,6 @@ impl Tcb {
     fn back_n(&mut self) -> bool {
         if let Some(v) = self.inflight_packets.front() {
             self.back_seq.replace(v.start());
-            self.congestion_window.on_loss();
             self.reset_write_timeout();
             true
         } else {
@@ -870,7 +955,10 @@ impl Tcb {
             self.timeout_wait();
             return;
         }
-        if !self.back_n() {
+        if self.back_n() {
+            self.congestion_window.on_rto();
+            self.backoff_rto();
+        } else {
             // Nothing inflight: the give-up counter must still run while an
             // unacknowledged FIN is being retransmitted
             let awaiting_fin_ack = matches!(self.state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck);
@@ -1059,8 +1147,17 @@ impl CongestionWindow {
         self.cwnd = self.cwnd.min(self.max_cwnd);
     }
 
-    pub fn on_loss(&mut self) {
-        self.ssthresh = self.cwnd / 2;
+    fn loss_ssthresh(&self) -> usize {
+        (self.cwnd / 2).max(2 * self.mss)
+    }
+
+    pub fn on_fast_retransmit(&mut self) {
+        self.ssthresh = self.loss_ssthresh();
+        self.cwnd = self.ssthresh;
+    }
+
+    pub fn on_rto(&mut self) {
+        self.ssthresh = self.loss_ssthresh();
         self.cwnd = self.mss;
     }
 

@@ -1,34 +1,11 @@
-#![allow(unused, unused_variables)]
 use crate::tcp::tcb::UnreadPacket;
-use bytes::{Buf, BytesMut};
-use std::cmp::Ordering;
-use std::collections::LinkedList;
-use std::marker::PhantomData;
-use std::mem;
-use std::ops::Deref;
-use std::ptr::NonNull;
+use bytes::BytesMut;
+use std::collections::{BTreeMap, LinkedList};
 
 #[derive(Debug, Default)]
 pub(crate) struct TcpReceiveQueue {
     total_bytes: usize,
     queue: LinkedList<BytesMut>,
-}
-pub(crate) struct TcpReceiveQueueItem<'a> {
-    total_bytes: &'a mut usize,
-    payload: &'a mut BytesMut,
-}
-impl Deref for TcpReceiveQueueItem<'_> {
-    type Target = BytesMut;
-
-    fn deref(&self) -> &Self::Target {
-        self.payload
-    }
-}
-impl TcpReceiveQueueItem<'_> {
-    pub fn advance(&mut self, cnt: usize) {
-        self.payload.advance(cnt);
-        *self.total_bytes -= cnt;
-    }
 }
 impl TcpReceiveQueue {
     pub fn push(&mut self, elt: BytesMut) {
@@ -43,19 +20,12 @@ impl TcpReceiveQueue {
             None
         }
     }
-    pub fn peek(&mut self) -> Option<TcpReceiveQueueItem<'_>> {
-        let total_bytes = &mut self.total_bytes;
-        self.queue.front_mut().map(|payload| TcpReceiveQueueItem { total_bytes, payload })
-    }
     pub fn clear(&mut self) {
         self.queue.clear();
         self.total_bytes = 0;
     }
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
-    }
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 }
 #[derive(Debug, Default)]
@@ -89,13 +59,6 @@ impl TcpOfoQueue {
     pub fn peek(&self) -> Option<&UnreadPacket> {
         self.queue.peek()
     }
-    pub fn clear(&mut self) {
-        self.queue.clear();
-        self.total_bytes = 0;
-    }
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -112,27 +75,9 @@ impl<'a> IntoIterator for &'a TcpOfoQueue {
 
 #[derive(Debug)]
 pub struct OrderQueue<T> {
-    head: Option<NonNull<Node<T>>>,
-    tail: Option<NonNull<Node<T>>>,
-    len: usize,
+    entries: BTreeMap<T, ()>,
 }
-
-struct Node<T> {
-    next: Option<NonNull<Node<T>>>,
-    prev: Option<NonNull<Node<T>>>,
-    element: T,
-}
-
-impl<T> Node<T> {
-    fn new(element: T) -> Self {
-        Node {
-            next: None,
-            prev: None,
-            element,
-        }
-    }
-}
-impl<T> Default for OrderQueue<T> {
+impl<T: Ord> Default for OrderQueue<T> {
     fn default() -> Self {
         OrderQueue::new()
     }
@@ -146,141 +91,48 @@ impl<T: Ord> OrderQueue<T> {
     where
         F: Fn(&T, &T) -> bool,
     {
-        let mut prev = self.tail;
-        while let Some(mut v) = prev {
-            unsafe {
-                let curr_elt = &v.as_ref().element;
-                match curr_elt.cmp(&elt) {
-                    Ordering::Less => break,
-                    Ordering::Equal => {
-                        return if compute(curr_elt, &elt) {
-                            Some(mem::replace(&mut v.as_mut().element, elt))
-                        } else {
-                            Some(elt)
-                        };
-                    }
-                    Ordering::Greater => {
-                        prev = v.as_ref().prev;
-                    }
-                }
+        if let Some((curr, _)) = self.entries.get_key_value(&elt) {
+            if compute(curr, &elt) {
+                let (old, _) = self.entries.remove_entry(&elt).expect("existing key must be removable");
+                self.entries.insert(elt, ());
+                return Some(old);
             }
+            return Some(elt);
         }
-
-        let mut node = Box::new(Node::new(elt));
-        node.prev = prev;
-        let node_ptr = NonNull::from(Box::leak(node));
-        let node = Some(node_ptr);
-
-        unsafe {
-            match prev {
-                None => {
-                    (*node_ptr.as_ptr()).next = self.head;
-                    self.head = node
-                }
-                Some(prev) => {
-                    (*node_ptr.as_ptr()).next = (*prev.as_ptr()).next;
-                    (*prev.as_ptr()).next = node
-                }
-            }
-            match (*node_ptr.as_ptr()).next {
-                None => {
-                    self.tail = node;
-                }
-                Some(next) => {
-                    (*next.as_ptr()).prev = node;
-                }
-            }
-        }
-
-        self.len += 1;
+        self.entries.insert(elt, ());
         None
     }
 }
 
-impl<T> OrderQueue<T> {
+impl<T: Ord> OrderQueue<T> {
     pub fn new() -> Self {
-        Self {
-            head: None,
-            tail: None,
-            len: 0,
-        }
+        Self { entries: BTreeMap::new() }
     }
     #[inline]
     pub fn peek(&self) -> Option<&T> {
-        self.head.map(|v| unsafe { &(*v.as_ptr()).element })
+        self.entries.first_key_value().map(|(key, _)| key)
     }
     pub fn pop(&mut self) -> Option<T> {
-        self.head.map(|node| {
-            unsafe {
-                let node = Box::from_raw(node.as_ptr());
-                self.head = node.next;
-
-                match self.head {
-                    None => self.tail = None,
-                    // Not creating new mutable (unique!) references overlapping `element`.
-                    Some(head) => (*head.as_ptr()).prev = None,
-                }
-                self.len -= 1;
-                node.element
-            }
-        })
+        self.entries.pop_first().map(|(key, _)| key)
     }
     pub fn clear(&mut self) {
-        drop(OrderQueue {
-            head: self.head.take(),
-            tail: self.tail.take(),
-            len: mem::take(&mut self.len),
-        });
+        self.entries.clear();
     }
     pub fn len(&self) -> usize {
-        self.len
+        self.entries.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.is_empty()
     }
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter {
-            head: self.head,
-            tail: self.tail,
-            len: self.len,
-            marker: PhantomData,
-        }
+        self.entries.keys()
     }
 }
 
-pub struct Iter<'a, T: 'a> {
-    head: Option<NonNull<Node<T>>>,
-    tail: Option<NonNull<Node<T>>>,
-    len: usize,
-    marker: PhantomData<&'a Node<T>>,
-}
+pub type Iter<'a, T> = std::collections::btree_map::Keys<'a, T, ()>;
 
 pub struct IntoIter<T> {
-    list: OrderQueue<T>,
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    #[inline]
-    fn next(&mut self) -> Option<&'a T> {
-        if self.len == 0 {
-            None
-        } else {
-            self.head.map(|node| unsafe {
-                // Need an unbound lifetime to get 'a
-                let node = &*node.as_ptr();
-                self.len -= 1;
-                self.head = node.next;
-                &node.element
-            })
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.len, Some(self.len))
-    }
+    keys: std::collections::btree_map::IntoKeys<T, ()>,
 }
 
 impl<T> Iterator for IntoIter<T> {
@@ -288,16 +140,16 @@ impl<T> Iterator for IntoIter<T> {
 
     #[inline]
     fn next(&mut self) -> Option<T> {
-        self.list.pop()
+        self.keys.next()
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.list.len, Some(self.list.len))
+        self.keys.size_hint()
     }
 }
 
-impl<'a, T> IntoIterator for &'a OrderQueue<T> {
+impl<'a, T: Ord> IntoIterator for &'a OrderQueue<T> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
 
@@ -313,18 +165,11 @@ impl<T> IntoIterator for OrderQueue<T> {
     /// Consumes the list into an iterator yielding elements by value.
     #[inline]
     fn into_iter(self) -> IntoIter<T> {
-        IntoIter { list: self }
+        IntoIter {
+            keys: self.entries.into_keys(),
+        }
     }
 }
-
-impl<T> Drop for OrderQueue<T> {
-    fn drop(&mut self) {
-        while self.pop().is_some() {}
-    }
-}
-unsafe impl<T: Send> Send for OrderQueue<T> {}
-
-unsafe impl<T: Sync> Sync for OrderQueue<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -413,19 +258,19 @@ mod tests {
     fn test_len() {
         let mut queue = OrderQueue::new();
 
-        assert_eq!(queue.len, 0);
+        assert_eq!(queue.len(), 0);
 
         queue.push(10, |_, _| false);
-        assert_eq!(queue.len, 1);
+        assert_eq!(queue.len(), 1);
 
         queue.push(20, |_, _| false);
-        assert_eq!(queue.len, 2);
+        assert_eq!(queue.len(), 2);
 
         queue.pop();
-        assert_eq!(queue.len, 1);
+        assert_eq!(queue.len(), 1);
 
         queue.pop();
-        assert_eq!(queue.len, 0);
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]
@@ -448,10 +293,10 @@ mod tests {
         let mut queue = OrderQueue::new();
 
         // Create elements that track drop count
-        let mut elem1 = Arc::new(10);
-        let mut elem2 = Arc::new(100);
-        let mut elem3 = Arc::new(5);
-        let mut elem4 = Arc::new(6);
+        let elem1 = Arc::new(10);
+        let elem2 = Arc::new(100);
+        let elem3 = Arc::new(5);
+        let elem4 = Arc::new(6);
 
         // Push elements into the queue
         queue.push(elem1.clone(), |_, _| false);
