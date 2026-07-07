@@ -737,7 +737,7 @@ impl IpStackSend {
             let mut fragments = map.remove(&id_key).unwrap();
             fragments
                 .bufs
-                .sort_by(|ip_fragment1, ip_fragment2| ip_fragment1.offset.cmp(&ip_fragment2.offset));
+                .sort_by_key(|ip_fragment1| ip_fragment1.offset);
             let mut total_payload_len = 0;
             for ip_fragment in &fragments.bufs {
                 if total_payload_len as u16 != ip_fragment.offset {
@@ -1206,7 +1206,7 @@ impl Routes {
             }
         }
         self.v4_table.push((dest, mask, ip));
-        self.v4_table.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v4_table.sort_by_key(|b| std::cmp::Reverse(b.1));
         Ok(())
     }
     fn add_v6(&mut self, dest: Ipv6Addr, mask: Ipv6Addr, ip: Ipv6Addr) -> io::Result<()> {
@@ -1225,7 +1225,7 @@ impl Routes {
             }
         }
         self.v6_table.push((dest, mask, ip));
-        self.v6_table.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v6_table.sort_by_key(|b| std::cmp::Reverse(b.1));
         Ok(())
     }
     fn remove_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) -> io::Result<()> {
