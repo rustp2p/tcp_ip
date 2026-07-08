@@ -1117,10 +1117,10 @@ pub fn create_packet_raw(
     bytes.extend_from_slice(payload);
     let checksum = match (local_addr.ip(), peer_addr.ip()) {
         (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
-            pnet_packet::util::ipv4_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+            crate::checksum::ipv4_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
         }
         (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
-            pnet_packet::util::ipv6_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
+            crate::checksum::ipv6_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
         }
         (_, _) => {
             unreachable!()

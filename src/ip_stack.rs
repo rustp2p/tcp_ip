@@ -308,10 +308,10 @@ mod config_tests {
     }
 
     #[test]
-    fn mtu_builder_alias_sets_ipv4_mtu_only() {
+    fn mtu_builder_alias_sets_both_mtus() {
         let config = IpStackConfig::builder().mtu(1400).build();
         assert_eq!(config.ipv4_mtu(), 1400);
-        assert_eq!(config.ipv6_mtu(), 1500);
+        assert_eq!(config.ipv6_mtu(), 1400);
     }
 }
 
@@ -739,7 +739,7 @@ impl IpStackSend {
                 }
                 if self.ip_stack.config.validate_checksums() {
                     let header = &buf[..header_len];
-                    let checksum = pnet_packet::util::checksum(header, 5);
+                    let checksum = crate::checksum::checksum(header, 5);
                     if checksum != packet.get_checksum() {
                         log::debug!(
                             "drop ipv4 packet with invalid header checksum: expected={checksum:#06x} actual={:#06x}",
@@ -950,8 +950,8 @@ impl IpStackSend {
             return true;
         }
         let expected_checksum = |skipword: usize, protocol: IpNextHeaderProtocol| match (network_tuple.src.ip(), network_tuple.dst.ip()) {
-            (IpAddr::V4(src), IpAddr::V4(dst)) => pnet_packet::util::ipv4_checksum(payload, skipword, &[], &src, &dst, protocol),
-            (IpAddr::V6(src), IpAddr::V6(dst)) => pnet_packet::util::ipv6_checksum(payload, skipword, &[], &src, &dst, protocol),
+            (IpAddr::V4(src), IpAddr::V4(dst)) => crate::checksum::ipv4_checksum(payload, skipword, &src, &dst, protocol),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => crate::checksum::ipv6_checksum(payload, skipword, &src, &dst, protocol),
             (_, _) => 0,
         };
         match network_tuple.protocol {
@@ -1303,7 +1303,7 @@ impl IpStackRecvInner {
             ip_header[12..16].copy_from_slice(&src_ip.octets());
             ip_header[16..20].copy_from_slice(&dst_ip.octets());
 
-            let checksum = pnet_packet::util::checksum(ip_header, 5);
+            let checksum = crate::checksum::checksum(ip_header, 5);
             ip_header[10..12].copy_from_slice(&checksum.to_be_bytes());
             let ip_payload = &mut buf[IPV4_HEADER_SIZE..total_length];
             ip_payload.copy_from_slice(&packet.buf[offset..offset + fragment_size]);

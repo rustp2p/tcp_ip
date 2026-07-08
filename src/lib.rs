@@ -43,6 +43,7 @@ pub async fn main() -> std::io::Result<()> {
 */
 
 mod buffer;
+pub(crate) mod checksum;
 pub mod icmp;
 mod ip_stack;
 mod ipv6;
