@@ -4,6 +4,7 @@ use std::io::Error;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
@@ -65,7 +66,7 @@ pub struct TcpListener {
     ip_stack: IpStack,
     packet_receiver: Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
-    tcb_map: HashMap<NetworkTuple, Tcb>,
+    tcb_map: HashMap<NetworkTuple, (Tcb, Instant)>,
 }
 
 /// A TCP stream between a local and a remote socket.
@@ -181,7 +182,21 @@ impl TcpListener {
                 let sequence = tcp_packet.get_sequence();
                 let local_addr = network_tuple.dst;
                 let peer_addr = network_tuple.src;
+                if tcp_packet.get_flags() & RST == RST {
+                    if let Some((tcb, _)) = self.tcb_map.get(network_tuple) {
+                        if tcb.rst_acceptable(&tcp_packet) {
+                            self.tcb_map.remove(network_tuple);
+                            self.ip_stack.remove_tcp_half_open(network_tuple);
+                        }
+                    }
+                    continue;
+                }
+                self.expire_half_open();
                 if tcp_packet.get_flags() & SYN == SYN {
+                    if !self.tcb_map.contains_key(network_tuple) && self.tcb_map.len() >= self.ip_stack.config.tcp_max_half_open {
+                        log::debug!("drop tcp syn: half-open connection limit reached");
+                        continue;
+                    }
                     // LISTEN -> SYN_RECEIVED
                     let mut tcp_config = self.ip_stack.config.tcp_config;
                     if tcp_config.mss.is_none() {
@@ -190,14 +205,14 @@ impl TcpListener {
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
                         self.ip_stack.add_tcp_half_open(*network_tuple);
-                        self.tcb_map.insert(*network_tuple, tcb);
+                        self.tcb_map.insert(*network_tuple, (tcb, Instant::now()));
                         self.ip_stack.send_packet(relay_packet).await?;
                         continue;
                     }
-                } else if let Some(tcb) = self.tcb_map.get_mut(network_tuple) {
+                } else if let Some((tcb, _)) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
                     if tcb.try_syn_received_to_established(packet.buf) {
-                        let tcb = self.tcb_map.remove(network_tuple).unwrap();
+                        let (tcb, _) = self.tcb_map.remove(network_tuple).unwrap();
                         let stream = TcpStream::new(self.ip_stack.clone(), tcb);
                         self.ip_stack.remove_tcp_half_open(network_tuple);
                         return Ok((stream?, peer_addr));
@@ -206,8 +221,6 @@ impl TcpListener {
                         self.tcb_map.remove(network_tuple).unwrap();
                         self.ip_stack.remove_tcp_half_open(network_tuple);
                     }
-                } else if tcp_packet.get_flags() & RST == RST {
-                    continue;
                 }
                 let data = tcb::create_transport_packet_raw(
                     &local_addr,
@@ -223,6 +236,18 @@ impl TcpListener {
                 return Err(Error::from(io::ErrorKind::UnexpectedEof));
             }
         }
+    }
+    fn expire_half_open(&mut self) {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let ip_stack = self.ip_stack.clone();
+        self.tcb_map.retain(|network_tuple, (_, created_at)| {
+            let keep = *created_at + timeout > now;
+            if !keep {
+                ip_stack.remove_tcp_half_open(network_tuple);
+            }
+            keep
+        });
     }
 }
 #[cfg(feature = "global-ip-stack")]

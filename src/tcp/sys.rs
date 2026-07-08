@@ -159,6 +159,18 @@ impl TcpStreamTask {
                     self.tcb.sent_fin();
                 }
                 TaskRecvData::Timeout => {
+                    if self.tcb.no_inflight_packet() && self.tcb.limit() && self.tcb.writeable_state() {
+                        if let Some(buf) = self.last_buffer.as_mut() {
+                            if let Some((packet, len)) = buf.first().copied().and_then(|probe_byte| self.tcb.write_probe(&[probe_byte])) {
+                                buf.advance(len);
+                                if buf.is_empty() {
+                                    self.last_buffer.take();
+                                }
+                                self.send_packet(packet).await?;
+                                continue;
+                            }
+                        }
+                    }
                     // Closing from TIME_WAIT is a normal end of the connection,
                     // anything else reaching Closed here is a retransmission give-up
                     let normal_close = self.tcb.time_wait().is_some();
@@ -170,7 +182,7 @@ impl TcpStreamTask {
                             Err(Error::new(io::ErrorKind::TimedOut, "retransmission timed out"))
                         };
                     }
-                    if self.tcb.cannot_write() {
+                    if self.tcb.cannot_write() && !self.tcb.fin_acknowledged() {
                         let packet = self.tcb.fin_packet();
                         self.send_packet(packet).await?;
                     }
@@ -286,9 +298,6 @@ impl TcpStreamTask {
     }
 
     async fn try_retransmission(&mut self) -> io::Result<bool> {
-        if self.write_half_closed {
-            return Ok(false);
-        }
         if let Some(v) = self.tcb.retransmission() {
             self.send_packet(v).await?;
             return Ok(true);
@@ -326,14 +335,18 @@ impl TcpStreamTask {
                 self.recv_timeout_at(deadline).await
             }
         } else if self.write_half_closed {
-            let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config.time_wait_timeout);
-            self.recv_in_timeout_at(timeout_at).await
+            if self.tcb.fin_acknowledged() {
+                let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config.time_wait_timeout);
+                self.recv_in_timeout_at(timeout_at).await
+            } else {
+                self.recv_in_timeout(self.tcb.rto()).await
+            }
         } else if self.only_recv_in() {
             // Sending cannot make progress (e.g. the peer advertised a zero window
             // and nothing is inflight). Stop draining the application layer so that
             // `last_buffer` is not overwritten, and wake up periodically to retry
             // flushing, acting as a simple zero-window probe timer.
-            self.recv_in_timeout(self.ip_stack.config.tcp_config.retransmission_timeout).await
+            self.recv_in_timeout(self.tcb.rto()).await
         } else {
             self.recv().await
         }
@@ -392,32 +405,40 @@ impl TcpStreamTask {
 
 impl TcpStreamTask {
     pub async fn connect(&mut self) -> io::Result<()> {
-        let mut count = 0;
-        let mut time = 50;
-        while let Some(packet) = self.tcb.try_syn_sent() {
-            count += 1;
-            if count > 50 {
-                break;
-            }
+        let mut attempts = 0;
+        let mut time = Duration::from_millis(100);
+        while attempts < 50 {
+            let Some(packet) = self.tcb.try_syn_sent() else {
+                return if self.tcb.is_close() {
+                    Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+                } else {
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                };
+            };
+            attempts += 1;
             self.send_packet(packet).await?;
-            time *= 2;
-            return match self.recv_in_timeout(Duration::from_millis(time.min(3000))).await {
-                TaskRecvData::In(buf) => {
-                    if let Some(relay) = self.tcb.try_syn_sent_to_established(buf) {
-                        self.send_packet(relay).await?;
-                        Ok(())
-                    } else {
-                        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            let deadline = Instant::now().add(time.min(Duration::from_millis(3000)));
+            loop {
+                match self.recv_in_timeout_at(deadline).await {
+                    TaskRecvData::In(buf) => {
+                        if let Some(relay) = self.tcb.try_syn_sent_to_established(buf) {
+                            self.send_packet(relay).await?;
+                            return Ok(());
+                        }
+                        if self.tcb.is_close() {
+                            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+                        }
+                    }
+                    TaskRecvData::InClose => return Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                    TaskRecvData::Timeout => break,
+                    TaskRecvData::ReadNotify | TaskRecvData::Out(_) | TaskRecvData::OutClose => {
+                        continue;
                     }
                 }
-                TaskRecvData::InClose => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
-                TaskRecvData::Timeout => continue,
-                _ => {
-                    unreachable!()
-                }
-            };
+            }
+            time *= 2;
         }
-        Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        Err(io::Error::from(io::ErrorKind::TimedOut))
     }
 }
 

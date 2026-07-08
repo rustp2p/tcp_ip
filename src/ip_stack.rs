@@ -5,6 +5,7 @@ use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::Packet;
+use pnet_packet::{tcp::TcpPacket, udp::UdpPacket};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -18,6 +19,8 @@ use tokio::sync::Notify;
 
 pub(crate) const UNSPECIFIED_ADDR_V4: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 pub(crate) const UNSPECIFIED_ADDR_V6: SocketAddr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+const MAX_FRAGMENT_ENTRIES: usize = 128;
+const MAX_FRAGMENTS_PER_PACKET: usize = 128;
 pub(crate) const fn default_addr(is_v4: bool) -> SocketAddr {
     if is_v4 {
         UNSPECIFIED_ADDR_V4
@@ -84,6 +87,8 @@ pub(crate) fn check_ip(ip: IpAddr) -> io::Result<()> {
 pub struct IpStackConfig {
     pub mtu: u16,
     pub ip_fragment_timeout: Duration,
+    pub validate_checksums: bool,
+    pub tcp_max_half_open: usize,
     pub tcp_config: crate::tcp::TcpConfig,
     pub channel_size: usize,
     pub tcp_syn_channel_size: usize,
@@ -100,6 +105,9 @@ impl IpStackConfig {
         }
         if self.ip_fragment_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_fragment_timeout is zero"));
+        }
+        if self.tcp_max_half_open == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tcp_max_half_open is zero"));
         }
 
         if self.channel_size == 0 {
@@ -129,6 +137,8 @@ impl Default for IpStackConfig {
         Self {
             mtu: 1500,
             ip_fragment_timeout: Duration::from_secs(10),
+            validate_checksums: true,
+            tcp_max_half_open: 1024,
             tcp_config: Default::default(),
             channel_size: 1024,
             tcp_syn_channel_size: 128,
@@ -539,10 +549,32 @@ impl IpStackSend {
     }
     /// Send the IP packet to this protocol stack.
     pub async fn send_ip_packet(&self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "ip packet is empty"));
+        }
         let p = buf[0] >> 4;
         match p {
             4 => {
                 let Some(packet) = Ipv4Packet::new(buf) else {
+                    return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                };
+                let header_len = packet.get_header_length() as usize * 4;
+                let total_length = packet.get_total_length() as usize;
+                if header_len < 20 || total_length < header_len || buf.len() < total_length {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ipv4 packet length"));
+                }
+                if self.ip_stack.config.validate_checksums {
+                    let header = &buf[..header_len];
+                    let checksum = pnet_packet::util::checksum(header, 5);
+                    if checksum != packet.get_checksum() {
+                        log::debug!(
+                            "drop ipv4 packet with invalid header checksum: expected={checksum:#06x} actual={:#06x}",
+                            packet.get_checksum()
+                        );
+                        return Ok(());
+                    }
+                }
+                let Some(packet) = Ipv4Packet::new(&buf[..total_length]) else {
                     return Err(io::Error::from(io::ErrorKind::InvalidInput));
                 };
 
@@ -678,8 +710,55 @@ impl IpStackSend {
             self.clear_fragment_cache(&id_key);
             packet.payload().into()
         };
+        if !self.validate_l4_checksum(&buf, network_tuple) {
+            return Ok(());
+        }
         _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
         Ok(())
+    }
+    fn validate_l4_checksum(&self, payload: &[u8], network_tuple: NetworkTuple) -> bool {
+        if !self.ip_stack.config.validate_checksums {
+            return true;
+        }
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (network_tuple.src.ip(), network_tuple.dst.ip()) else {
+            return true;
+        };
+        match network_tuple.protocol {
+            IpNextHeaderProtocols::Tcp => {
+                let Some(tcp_packet) = TcpPacket::new(payload) else {
+                    log::debug!("drop tcp packet with invalid header");
+                    return false;
+                };
+                let checksum = pnet_packet::util::ipv4_checksum(payload, 8, &[], &src, &dst, IpNextHeaderProtocols::Tcp);
+                if checksum != tcp_packet.get_checksum() {
+                    log::debug!(
+                        "drop tcp packet with invalid checksum: expected={checksum:#06x} actual={:#06x}",
+                        tcp_packet.get_checksum()
+                    );
+                    return false;
+                }
+                true
+            }
+            IpNextHeaderProtocols::Udp => {
+                let Some(udp_packet) = UdpPacket::new(payload) else {
+                    log::debug!("drop udp packet with invalid header");
+                    return false;
+                };
+                if udp_packet.get_checksum() == 0 {
+                    return true;
+                }
+                let checksum = pnet_packet::util::ipv4_checksum(payload, 3, &[], &src, &dst, IpNextHeaderProtocols::Udp);
+                if checksum != udp_packet.get_checksum() {
+                    log::debug!(
+                        "drop udp packet with invalid checksum: expected={checksum:#06x} actual={:#06x}",
+                        udp_packet.get_checksum()
+                    );
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        }
     }
     fn prepare_ipv4_fragments(&self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey) -> io::Result<Option<NetworkTuple>> {
         let offset = ip_packet.get_fragment_offset();
@@ -691,6 +770,10 @@ impl IpStackSend {
             convert_network_tuple(ip_packet)?
         } else {
             let mut guard = self.ident_fragments_map.lock();
+            if !guard.contains_key(&id_key) && guard.len() >= MAX_FRAGMENT_ENTRIES {
+                log::debug!("drop ipv4 fragment: fragment cache full");
+                return Ok(None);
+            }
             let p = guard.entry(id_key).or_default();
 
             if let Some(v) = p.network_tuple {
@@ -720,6 +803,10 @@ impl IpStackSend {
     }
     fn merge_ip_fragments(&self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey, network_tuple: NetworkTuple) -> io::Result<Option<BytesMut>> {
         let mut map = self.ident_fragments_map.lock();
+        if !map.contains_key(&id_key) && map.len() >= MAX_FRAGMENT_ENTRIES {
+            log::debug!("drop ipv4 fragment: fragment cache full");
+            return Ok(None);
+        }
         let ip_fragments = map
             .entry(id_key)
             .and_modify(|p| p.update_time())
@@ -974,6 +1061,13 @@ impl IpFragments {
         self.time = Instant::now();
     }
     fn add_fragment(&mut self, ip_fragment: IpFragment, last_fragment: bool) -> io::Result<()> {
+        if self.bufs.iter().any(|fragment| fragment.offset == ip_fragment.offset) {
+            log::debug!("ignore duplicate ipv4 fragment at offset {}", ip_fragment.offset);
+            return Ok(());
+        }
+        if self.bufs.len() >= MAX_FRAGMENTS_PER_PACKET {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "too many IP fragments"));
+        }
         if !last_fragment {
             let (read_len, overflow) = self.read_len.overflowing_add(ip_fragment.payload.len() as u16);
             if overflow {
