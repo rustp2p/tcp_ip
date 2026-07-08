@@ -73,7 +73,7 @@ impl TcpStreamTask {
     ) -> Self {
         Self {
             _bind_addr,
-            quick_end: ip_stack.config.tcp_config.quick_end,
+            quick_end: ip_stack.config.tcp_config().quick_end,
             tcb,
             ip_stack,
             application_layer_receiver,
@@ -336,7 +336,7 @@ impl TcpStreamTask {
             }
         } else if self.write_half_closed {
             if self.tcb.fin_acknowledged() {
-                let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config.time_wait_timeout);
+                let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config().time_wait_timeout);
                 self.recv_in_timeout_at(timeout_at).await
             } else {
                 self.recv_in_timeout(self.tcb.rto()).await

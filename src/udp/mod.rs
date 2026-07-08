@@ -62,7 +62,7 @@ impl UdpSocket {
 
 impl UdpSocket {
     async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>, peer_addr: Option<SocketAddr>) -> io::Result<Self> {
-        let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size);
+        let (packet_sender, packet_receiver) = flume::bounded(ip_stack.config.udp_channel_size());
         let _bind_addr = if let Some(addr) = &mut local_addr {
             Some(ip_stack.bind(IpNextHeaderProtocols::Udp, addr)?)
         } else {

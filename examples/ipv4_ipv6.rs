@@ -21,10 +21,7 @@ pub async fn main() -> anyhow::Result<()> {
         .ipv4("10.0.0.29", 24, None)
         .build_async()?;
     let dev = Arc::new(dev);
-    let ip_stack_config = IpStackConfig {
-        mtu: MTU,
-        ..Default::default()
-    };
+    let ip_stack_config = IpStackConfig::builder().ipv4_mtu(MTU).ipv6_mtu(MTU).build();
     let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     // None means receiving all protocols.
     let ip_socket = IpSocket::bind_all(None).await?;

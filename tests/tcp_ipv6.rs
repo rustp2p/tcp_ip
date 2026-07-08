@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use tcp_ip::tcp::{TcpListener, TcpStream};
+use tcp_ip::tcp::{TcpConfig, TcpListener, TcpStream};
 use tcp_ip::udp::UdpSocket;
 use tcp_ip::{ip_stack, IpStack, IpStackConfig, IpStackRecv, IpStackSend};
 
@@ -187,9 +187,12 @@ async fn large_transfer() {
 #[tokio::test]
 async fn large_transfer_lossy_and_reordered() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let mut config = IpStackConfig::default();
-        config.tcp_config.retransmission_timeout = Duration::from_millis(50);
-        config.tcp_config.time_wait_timeout = Duration::from_secs(1);
+        let tcp_config = TcpConfig {
+            retransmission_timeout: Duration::from_millis(50),
+            time_wait_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let config = IpStackConfig::builder().tcp_config(tcp_config).build();
         let (stack_a, stack_b) = connect_stacks(config, lossy_link);
         let server_addr: SocketAddr = format!("[{IP_B}]:8082").parse().unwrap();
         let mut listener = TcpListener::bind(stack_b, server_addr).await.unwrap();
@@ -224,11 +227,13 @@ async fn large_transfer_lossy_and_reordered() {
 #[tokio::test]
 async fn zero_window_no_data_loss() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let mut config = IpStackConfig::default();
-        config.tcp_config.rcv_wnd = 2048;
-        config.tcp_config.window_shift_cnt = 0;
-        config.tcp_config.retransmission_timeout = Duration::from_millis(100);
-        config.tcp_channel_size = 4;
+        let tcp_config = TcpConfig {
+            rcv_wnd: 2048,
+            window_shift_cnt: 0,
+            retransmission_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let config = IpStackConfig::builder().tcp_config(tcp_config).tcp_channel_size(4).build();
         let (stack_a, stack_b) = connect_stacks(config, perfect_link);
         let server_addr: SocketAddr = format!("[{IP_B}]:8083").parse().unwrap();
         let mut listener = TcpListener::bind(stack_b, server_addr).await.unwrap();
@@ -263,8 +268,11 @@ async fn zero_window_no_data_loss() {
 #[tokio::test]
 async fn read_half_dropped_connection_still_closes() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut config = IpStackConfig::default();
-        config.tcp_config.time_wait_timeout = Duration::from_millis(500);
+        let tcp_config = TcpConfig {
+            time_wait_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let config = IpStackConfig::builder().tcp_config(tcp_config).build();
         let (stack_a, stack_b) = connect_stacks(config, perfect_link);
         let server_addr: SocketAddr = format!("[{IP_B}]:8084").parse().unwrap();
         let mut listener = TcpListener::bind(stack_b.clone(), server_addr).await.unwrap();
@@ -365,7 +373,7 @@ async fn udp_fragmentation_out_of_order() {
 async fn ipv6_egress_fragments_respect_mtu() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let config = IpStackConfig::default();
-        let mtu = config.mtu as usize;
+        let mtu = config.ipv6_mtu() as usize;
         let (stack, _send, mut recv) = ip_stack(config).unwrap();
         let addr_a: SocketAddr = format!("[{IP_A}]:9004").parse().unwrap();
         let addr_b: SocketAddr = format!("[{IP_B}]:9005").parse().unwrap();

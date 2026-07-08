@@ -19,10 +19,7 @@ pub async fn main() -> anyhow::Result<()> {
     let local_ip = Ipv4Addr::new(10, 0, 0, 29);
     let dev = DeviceBuilder::new().mtu(MTU).ipv4(local_ip, 24, None).build_async()?;
     let dev = Arc::new(dev);
-    let ip_stack_config = IpStackConfig {
-        mtu: MTU,
-        ..Default::default()
-    };
+    let ip_stack_config = IpStackConfig::builder().ipv4_mtu(MTU).build();
     let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
     let dev1 = dev.clone();
     tokio::spawn(async {

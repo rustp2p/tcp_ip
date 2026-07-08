@@ -148,7 +148,7 @@ impl TcpListener {
 }
 impl TcpListener {
     async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>) -> io::Result<Self> {
-        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size);
+        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size());
         let _bind_addr = if let Some(addr) = &mut local_addr {
             Some(ip_stack.bind(IpNextHeaderProtocols::Tcp, addr)?)
         } else {
@@ -193,16 +193,17 @@ impl TcpListener {
                 }
                 self.expire_half_open();
                 if tcp_packet.get_flags() & SYN == SYN {
-                    if !self.tcb_map.contains_key(network_tuple) && self.tcb_map.len() >= self.ip_stack.config.tcp_max_half_open {
+                    if !self.tcb_map.contains_key(network_tuple) && self.tcb_map.len() >= self.ip_stack.config.tcp_max_half_open() {
                         log::debug!("drop tcp syn: half-open connection limit reached");
                         continue;
                     }
                     // LISTEN -> SYN_RECEIVED
-                    let mut tcp_config = self.ip_stack.config.tcp_config;
+                    let mut tcp_config = self.ip_stack.config.tcp_config();
                     if tcp_config.mss.is_none() {
-                        tcp_config
-                            .mss
-                            .replace(tcb::default_mss(self.ip_stack.config.mtu, local_addr.is_ipv4()));
+                        tcp_config.mss.replace(tcb::default_mss(
+                            self.ip_stack.config.mtu_for_ip(local_addr.is_ipv4()),
+                            local_addr.is_ipv4(),
+                        ));
                     }
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
@@ -346,14 +347,17 @@ impl TcpStream {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
     ) -> io::Result<Self> {
-        let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
-        let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size);
-        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
+        let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size());
+        let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size());
+        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size());
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
-        let mut tcp_config = ip_stack.config.tcp_config;
+        let mut tcp_config = ip_stack.config.tcp_config();
         if tcp_config.mss.is_none() {
-            tcp_config.mss.replace(tcb::default_mss(ip_stack.config.mtu, local_addr.is_ipv4()));
+            tcp_config.mss.replace(tcb::default_mss(
+                ip_stack.config.mtu_for_ip(local_addr.is_ipv4()),
+                local_addr.is_ipv4(),
+            ));
         }
         let tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
         let mut stream_task = TcpStreamTask::new(bind_addr, tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);
@@ -397,9 +401,9 @@ impl TcpStream {
     pub(crate) fn new0(ip_stack: IpStack, tcb: Tcb) -> io::Result<(Self, TcpStreamTask)> {
         let peer_addr = tcb.peer_addr();
         let local_addr = tcb.local_addr();
-        let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size);
-        let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size);
-        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size);
+        let (payload_sender_w, payload_receiver_w) = channel(ip_stack.config.tcp_channel_size());
+        let (payload_sender, payload_receiver) = channel(ip_stack.config.tcp_channel_size());
+        let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_channel_size());
         let network_tuple = NetworkTuple::new(peer_addr, local_addr, IpNextHeaderProtocols::Tcp);
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
         let mss = tcb.mss() as usize;

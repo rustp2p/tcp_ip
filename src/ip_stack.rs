@@ -85,23 +85,90 @@ pub(crate) fn check_ip(ip: IpAddr) -> io::Result<()> {
 /// Configure the protocol stack
 #[derive(Copy, Clone, Debug)]
 pub struct IpStackConfig {
-    pub mtu: u16,
-    pub ip_fragment_timeout: Duration,
-    pub validate_checksums: bool,
-    pub tcp_max_half_open: usize,
-    pub tcp_config: crate::tcp::TcpConfig,
-    pub channel_size: usize,
-    pub tcp_syn_channel_size: usize,
-    pub tcp_channel_size: usize,
-    pub udp_channel_size: usize,
-    pub icmp_channel_size: usize,
-    pub ip_channel_size: usize,
+    ipv4_mtu: u16,
+    ipv6_mtu: u16,
+    ip_fragment_timeout: Duration,
+    validate_checksums: bool,
+    tcp_max_half_open: usize,
+    tcp_config: crate::tcp::TcpConfig,
+    channel_size: usize,
+    tcp_syn_channel_size: usize,
+    tcp_channel_size: usize,
+    udp_channel_size: usize,
+    icmp_channel_size: usize,
+    ip_channel_size: usize,
 }
 
 impl IpStackConfig {
+    pub const IPV4_MIN_MTU: u16 = 576;
+    pub const IPV6_MIN_MTU: u16 = 1280;
+
+    pub fn builder() -> IpStackConfigBuilder {
+        IpStackConfigBuilder::default()
+    }
+
+    pub fn ipv4_mtu(&self) -> u16 {
+        self.ipv4_mtu
+    }
+
+    pub fn ipv6_mtu(&self) -> u16 {
+        self.ipv6_mtu
+    }
+
+    pub fn mtu_for_ip(&self, is_ipv4: bool) -> u16 {
+        if is_ipv4 {
+            self.ipv4_mtu
+        } else {
+            self.ipv6_mtu
+        }
+    }
+
+    pub fn ip_fragment_timeout(&self) -> Duration {
+        self.ip_fragment_timeout
+    }
+
+    pub fn validate_checksums(&self) -> bool {
+        self.validate_checksums
+    }
+
+    pub fn tcp_max_half_open(&self) -> usize {
+        self.tcp_max_half_open
+    }
+
+    pub fn tcp_config(&self) -> crate::tcp::TcpConfig {
+        self.tcp_config
+    }
+
+    pub fn channel_size(&self) -> usize {
+        self.channel_size
+    }
+
+    pub fn tcp_syn_channel_size(&self) -> usize {
+        self.tcp_syn_channel_size
+    }
+
+    pub fn tcp_channel_size(&self) -> usize {
+        self.tcp_channel_size
+    }
+
+    pub fn udp_channel_size(&self) -> usize {
+        self.udp_channel_size
+    }
+
+    pub fn icmp_channel_size(&self) -> usize {
+        self.icmp_channel_size
+    }
+
+    pub fn ip_channel_size(&self) -> usize {
+        self.ip_channel_size
+    }
+
     pub fn check(&self) -> io::Result<()> {
-        if self.mtu < 576 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "mtu<576"));
+        if self.ipv4_mtu < Self::IPV4_MIN_MTU {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ipv4_mtu<576"));
+        }
+        if self.ipv6_mtu < Self::IPV6_MIN_MTU {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ipv6_mtu<1280"));
         }
         if self.ip_fragment_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ip_fragment_timeout is zero"));
@@ -135,7 +202,8 @@ impl IpStackConfig {
 impl Default for IpStackConfig {
     fn default() -> Self {
         Self {
-            mtu: 1500,
+            ipv4_mtu: 1500,
+            ipv6_mtu: 1500,
             ip_fragment_timeout: Duration::from_secs(10),
             validate_checksums: true,
             tcp_max_half_open: 1024,
@@ -147,6 +215,103 @@ impl Default for IpStackConfig {
             icmp_channel_size: 128,
             ip_channel_size: 128,
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IpStackConfigBuilder {
+    config: IpStackConfig,
+}
+
+impl IpStackConfigBuilder {
+    pub fn ipv4_mtu(mut self, ipv4_mtu: u16) -> Self {
+        self.config.ipv4_mtu = ipv4_mtu;
+        self
+    }
+
+    pub fn mtu(self, mtu: u16) -> Self {
+        self.ipv4_mtu(mtu).ipv6_mtu(mtu)
+    }
+
+    pub fn ipv6_mtu(mut self, ipv6_mtu: u16) -> Self {
+        self.config.ipv6_mtu = ipv6_mtu;
+        self
+    }
+
+    pub fn ip_fragment_timeout(mut self, ip_fragment_timeout: Duration) -> Self {
+        self.config.ip_fragment_timeout = ip_fragment_timeout;
+        self
+    }
+
+    pub fn validate_checksums(mut self, validate_checksums: bool) -> Self {
+        self.config.validate_checksums = validate_checksums;
+        self
+    }
+
+    pub fn tcp_max_half_open(mut self, tcp_max_half_open: usize) -> Self {
+        self.config.tcp_max_half_open = tcp_max_half_open;
+        self
+    }
+
+    pub fn tcp_config(mut self, tcp_config: crate::tcp::TcpConfig) -> Self {
+        self.config.tcp_config = tcp_config;
+        self
+    }
+
+    pub fn channel_size(mut self, channel_size: usize) -> Self {
+        self.config.channel_size = channel_size;
+        self
+    }
+
+    pub fn tcp_syn_channel_size(mut self, tcp_syn_channel_size: usize) -> Self {
+        self.config.tcp_syn_channel_size = tcp_syn_channel_size;
+        self
+    }
+
+    pub fn tcp_channel_size(mut self, tcp_channel_size: usize) -> Self {
+        self.config.tcp_channel_size = tcp_channel_size;
+        self
+    }
+
+    pub fn udp_channel_size(mut self, udp_channel_size: usize) -> Self {
+        self.config.udp_channel_size = udp_channel_size;
+        self
+    }
+
+    pub fn icmp_channel_size(mut self, icmp_channel_size: usize) -> Self {
+        self.config.icmp_channel_size = icmp_channel_size;
+        self
+    }
+
+    pub fn ip_channel_size(mut self, ip_channel_size: usize) -> Self {
+        self.config.ip_channel_size = ip_channel_size;
+        self
+    }
+
+    pub fn build(self) -> IpStackConfig {
+        self.config
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_ipv6_mtu_below_minimum() {
+        let err = IpStackConfig::builder()
+            .ipv6_mtu(IpStackConfig::IPV6_MIN_MTU - 1)
+            .build()
+            .check()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn mtu_builder_alias_sets_ipv4_mtu_only() {
+        let config = IpStackConfig::builder().mtu(1400).build();
+        assert_eq!(config.ipv4_mtu(), 1400);
+        assert_eq!(config.ipv6_mtu(), 1500);
     }
 }
 
@@ -255,20 +420,22 @@ pub struct IpStackRecv {
     bufs: Vec<BytesMut>,
 }
 struct IpStackRecvInner {
-    mtu: u16,
+    ipv4_mtu: u16,
+    ipv6_mtu: u16,
     identification: u16,
     identification_v6: u32,
     packet_receiver: Receiver<TransportPacket>,
 }
 
 impl IpStackRecv {
-    pub(crate) fn new(mtu: u16, packet_receiver: Receiver<TransportPacket>) -> Self {
+    pub(crate) fn new(ipv4_mtu: u16, ipv6_mtu: u16, packet_receiver: Receiver<TransportPacket>) -> Self {
         let millis = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|v| v.as_millis())
             .unwrap_or(0);
         let inner = IpStackRecvInner {
-            mtu,
+            ipv4_mtu,
+            ipv6_mtu,
             identification: (millis & 0xFFFF) as u16,
             identification_v6: (millis & 0xFFFF_FFFF) as u32,
             packet_receiver,
@@ -362,14 +529,14 @@ pub fn ip_stack(config: IpStackConfig) -> io::Result<(IpStackSend, IpStackRecv)>
 }
 fn ip_stack0(config: IpStackConfig) -> io::Result<(IpStack, IpStackSend, IpStackRecv)> {
     config.check()?;
-    let (packet_sender, packet_receiver) = channel(config.channel_size);
+    let (packet_sender, packet_receiver) = channel(config.channel_size());
     let ip_stack = IpStack::new(config, packet_sender);
     let ip_stack_send = IpStackSend::new(ip_stack.clone());
-    let ip_stack_recv = IpStackRecv::new(ip_stack.config.mtu, packet_receiver);
+    let ip_stack_recv = IpStackRecv::new(ip_stack.config.ipv4_mtu(), ip_stack.config.ipv6_mtu(), packet_receiver);
     {
         let ident_fragments_map = ip_stack_send.ident_fragments_map.clone();
         let notify = ip_stack_send.notify.clone();
-        let timeout = ip_stack.config.ip_fragment_timeout;
+        let timeout = ip_stack.config.ip_fragment_timeout();
         tokio::spawn(async move {
             loop_check_timeouts(timeout, ident_fragments_map, notify).await;
         });
@@ -570,7 +737,7 @@ impl IpStackSend {
                 if header_len < 20 || total_length < header_len || buf.len() < total_length {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ipv4 packet length"));
                 }
-                if self.ip_stack.config.validate_checksums {
+                if self.ip_stack.config.validate_checksums() {
                     let header = &buf[..header_len];
                     let checksum = pnet_packet::util::checksum(header, 5);
                     if checksum != packet.get_checksum() {
@@ -779,7 +946,7 @@ impl IpStackSend {
         Ok(())
     }
     fn validate_l4_checksum(&self, payload: &[u8], network_tuple: NetworkTuple) -> bool {
-        if !self.ip_stack.config.validate_checksums {
+        if !self.ip_stack.config.validate_checksums() {
             return true;
         }
         let expected_checksum = |skipword: usize, protocol: IpNextHeaderProtocol| match (network_tuple.src.ip(), network_tuple.dst.ip()) {
@@ -980,8 +1147,9 @@ impl IpStackRecv {
                 self.sizes.resize(128, 0);
             }
             if self.bufs.is_empty() {
+                let mtu = self.inner.ipv4_mtu.max(self.inner.ipv6_mtu) as usize;
                 for _ in 0..128 {
-                    self.bufs.push(BytesMut::zeroed(self.inner.mtu as usize));
+                    self.bufs.push(BytesMut::zeroed(mtu));
                 }
             }
             self.num = self.inner.recv_ip_packet(&mut self.bufs, &mut self.sizes).await?;
@@ -1020,7 +1188,7 @@ impl IpStackRecvInner {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
         };
         let protocol = packet.network_tuple.protocol;
-        let mtu = self.mtu as usize;
+        let mtu = self.ipv6_mtu as usize;
 
         let write_ipv6_header = |buf: &mut [u8], next_header: IpNextHeaderProtocol, payload_length: usize| {
             buf[0] = 6 << 4; // Version (6) + Traffic Class
@@ -1087,7 +1255,7 @@ impl IpStackRecvInner {
         Ok(total_packets)
     }
     fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
-        let mtu = self.mtu;
+        let mtu = self.ipv4_mtu;
         self.identification = self.identification.wrapping_sub(1);
         let identification = self.identification;
         let mut offset = 0;

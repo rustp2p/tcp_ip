@@ -21,7 +21,7 @@ impl IcmpSocket {
         }
         let ip_stack = IpStack::get()?;
         let raw_ip_socket = IpSocket::bind0(
-            ip_stack.config.icmp_channel_size,
+            ip_stack.config.icmp_channel_size(),
             Some(IpNextHeaderProtocols::Icmp),
             ip_stack,
             Some(local_ip),
@@ -40,7 +40,7 @@ impl IcmpSocket {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "need to use IcmpV6Socket"));
         }
         let raw_ip_socket = IpSocket::bind0(
-            ip_stack.config.icmp_channel_size,
+            ip_stack.config.icmp_channel_size(),
             Some(IpNextHeaderProtocols::Icmp),
             ip_stack,
             Some(local_ip),
@@ -72,7 +72,7 @@ impl IcmpV6Socket {
         }
         let ip_stack = IpStack::get()?;
         let raw_ip_socket = IpSocket::bind0(
-            ip_stack.config.icmp_channel_size,
+            ip_stack.config.icmp_channel_size(),
             Some(IpNextHeaderProtocols::Icmpv6),
             ip_stack,
             Some(local_ip),
@@ -91,7 +91,7 @@ impl IcmpV6Socket {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "need to use IcmpSocket"));
         }
         let raw_ip_socket = IpSocket::bind0(
-            ip_stack.config.icmp_channel_size,
+            ip_stack.config.icmp_channel_size(),
             Some(IpNextHeaderProtocols::Icmpv6),
             ip_stack,
             Some(local_ip),
