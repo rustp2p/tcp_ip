@@ -29,7 +29,7 @@ global-ip-stack = ["lazy_static"]
 tokio = { version = "1.42", features = ["full"] }
 anyhow = "1"
 env_logger = "0.11"
-tun-rs = { version = "1.5.0", features = ["async"] }
+tun-rs = { version = "2.8.6", features = ["async"] }
 clap = { version = "4", features = ["derive"] }
 
 [[example]]
