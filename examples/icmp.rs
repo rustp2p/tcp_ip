@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tcp_ip::icmp::{IcmpSocket, IcmpV6Socket};
 use tcp_ip::ip::IpSocket;
 use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
-use tun_rs::{AsyncDevice, Configuration};
+use tun_rs::{AsyncDevice, DeviceBuilder};
 
 const MTU: u16 = 1420;
 
@@ -16,12 +16,11 @@ const MTU: u16 = 1420;
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
-    let mut config = Configuration::default();
-    config
+    let dev = DeviceBuilder::new()
         .mtu(MTU)
-        .address_with_prefix_multi(&[("CDCD:910A:2222:5498:8475:1111:3900:2025", 64), ("10.0.0.29", 24)])
-        .up();
-    let dev = tun_rs::create_as_async(&config)?;
+        .ipv6("CDCD:910A:2222:5498:8475:1111:3900:2025", 64)
+        .ipv4("10.0.0.29", 24, None)
+        .build_async()?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig {
         mtu: MTU,

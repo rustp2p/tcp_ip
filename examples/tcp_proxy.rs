@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use clap::Parser;
 use pnet_packet::Packet;
-use tun_rs::{AsyncDevice, Configuration};
+use tun_rs::{AsyncDevice, DeviceBuilder};
 
 use tcp_ip::tcp::TcpListener;
 use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
@@ -24,12 +24,11 @@ pub async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let server_addr = args.server_addr;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let mut config = Configuration::default();
-    config
+    let dev = DeviceBuilder::new()
         .mtu(MTU)
-        .address_with_prefix_multi(&[("CDCD:910A:2222:5498:8475:1111:3900:2025", 64), ("10.0.0.29", 24)])
-        .up();
-    let dev = tun_rs::create_as_async(&config)?;
+        .ipv6("CDCD:910A:2222:5498:8475:1111:3900:2025", 64)
+        .ipv4("10.0.0.29", 24, None)
+        .build_async()?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig {
         mtu: MTU,

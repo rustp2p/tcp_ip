@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use pnet_packet::Packet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tun_rs::{AsyncDevice, Configuration};
+use tun_rs::{AsyncDevice, DeviceBuilder};
 
 use tcp_ip::{ip_stack, IpStackConfig, IpStackRecv, IpStackSend};
 
@@ -16,10 +16,8 @@ const MTU: u16 = 1420;
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    let mut config = Configuration::default();
     let local_ip = Ipv4Addr::new(10, 0, 0, 29);
-    config.mtu(MTU).address_with_prefix(local_ip, 24).up();
-    let dev = tun_rs::create_as_async(&config)?;
+    let dev = DeviceBuilder::new().mtu(MTU).ipv4(local_ip, 24, None).build_async()?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig {
         mtu: MTU,
