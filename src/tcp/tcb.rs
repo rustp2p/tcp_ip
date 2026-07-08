@@ -426,10 +426,10 @@ impl Tcb {
         None
     }
     fn init_congestion_window(&mut self) {
-        let initial_cwnd = self.mss as usize * 4;
+        // RFC 6928 initial window
+        let initial_cwnd = self.mss as usize * 10;
         let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
-        self.congestion_window
-            .init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd, self.mss as usize);
+        self.congestion_window.init(initial_cwnd, max_cwnd, self.mss as usize);
     }
 }
 
@@ -589,6 +589,8 @@ impl Tcb {
                             }
                         }
                         self.snd_wnd = packet.get_window();
+                        self.congestion_window
+                            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
                     }
 
                     self.update_last_ack(&packet);
@@ -773,9 +775,11 @@ impl Tcb {
             return;
         }
         self.snd_wnd = tcp_packet.get_window();
-        self.congestion_window.on_ack();
+        self.congestion_window
+            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
+        self.congestion_window.on_ack(distance);
         self.rcv_ack = ack;
         let now = Instant::now();
         let mut rtt_candidate_seen = false;
@@ -1139,17 +1143,28 @@ struct CongestionWindow {
 }
 
 impl CongestionWindow {
-    pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize, mss: usize) {
+    pub fn init(&mut self, initial_cwnd: usize, max_cwnd: usize, mss: usize) {
         self.cwnd = initial_cwnd;
-        self.ssthresh = initial_ssthresh;
+        // "Infinite" until the first loss (RFC 5681): the handshake-time peer
+        // window says nothing about path capacity
+        self.ssthresh = usize::MAX / 2;
         self.max_cwnd = max_cwnd;
         self.mss = mss;
     }
 
-    pub fn on_ack(&mut self) {
+    /// The peer's advertised window grows as its autotuning kicks in; growing
+    /// cwnd beyond the largest window ever seen is useless, but capping it at
+    /// the handshake-time value would freeze throughput.
+    pub fn update_max_cwnd(&mut self, wnd: usize) {
+        self.max_cwnd = self.max_cwnd.max(wnd);
+    }
+
+    pub fn on_ack(&mut self, bytes_acked: usize) {
         if self.cwnd < self.ssthresh {
-            // Slow start: one MSS per ACK, doubling the window every RTT
-            self.cwnd += self.mss;
+            // Slow start with appropriate byte counting (RFC 3465): ACKs are
+            // batched here, so growing by the acked bytes rather than one MSS
+            // per ACK keeps doubling every RTT
+            self.cwnd += bytes_acked.min(2 * self.mss);
         } else {
             // Congestion avoidance: about one MSS per RTT
             self.cwnd += (self.mss * self.mss / self.cwnd).max(1);
