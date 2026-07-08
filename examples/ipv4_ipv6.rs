@@ -18,7 +18,7 @@ pub async fn main() -> anyhow::Result<()> {
     let dev = DeviceBuilder::new()
         .mtu(MTU)
         .ipv6("CDCD:910A:2222:5498:8475:1111:3900:2025", 64)
-        .ipv4("10.0.0.29", 24, None)
+        .ipv4("10.1.0.29", 24, None)
         .build_async()?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig::builder().ipv4_mtu(MTU).ipv6_mtu(MTU).build();

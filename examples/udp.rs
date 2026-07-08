@@ -8,7 +8,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 
 const MTU: u16 = 1420;
 
-/// After starting, use a UDP send to any port in the 10.0.0.0/24 subnet
+/// After starting, use a UDP send to any port in the 10.1.0.0/24 subnet
 /// Sending data will receive a response.
 /// Specifically, if sent to port 8080, a response will be received from udp_socket_8080
 #[tokio::main]
@@ -17,7 +17,7 @@ pub async fn main() -> anyhow::Result<()> {
     let dev = DeviceBuilder::new()
         .mtu(MTU)
         .ipv6("CDCD:910A:2222:5498:8475:1111:3900:2025", 64)
-        .ipv4("10.0.0.29", 24, None)
+        .ipv4("10.1.0.29", 24, None)
         .build_async()?;
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig::builder().ipv4_mtu(MTU).ipv6_mtu(MTU).build();
