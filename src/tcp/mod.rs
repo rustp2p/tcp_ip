@@ -200,7 +200,9 @@ impl TcpListener {
                     // LISTEN -> SYN_RECEIVED
                     let mut tcp_config = self.ip_stack.config.tcp_config;
                     if tcp_config.mss.is_none() {
-                        tcp_config.mss.replace(self.ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
+                        tcp_config
+                            .mss
+                            .replace(tcb::default_mss(self.ip_stack.config.mtu, local_addr.is_ipv4()));
                     }
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
@@ -351,7 +353,7 @@ impl TcpStream {
         ip_stack.add_tcp_socket(network_tuple, packet_sender)?;
         let mut tcp_config = ip_stack.config.tcp_config;
         if tcp_config.mss.is_none() {
-            tcp_config.mss.replace(ip_stack.config.mtu - tcb::IP_TCP_HEADER_LEN as u16);
+            tcp_config.mss.replace(tcb::default_mss(ip_stack.config.mtu, local_addr.is_ipv4()));
         }
         let tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
         let mut stream_task = TcpStreamTask::new(bind_addr, tcb, ip_stack, payload_sender, payload_receiver_w, packet_receiver);

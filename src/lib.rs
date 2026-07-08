@@ -45,6 +45,7 @@ pub async fn main() -> std::io::Result<()> {
 mod buffer;
 pub mod icmp;
 mod ip_stack;
+mod ipv6;
 pub use ip_stack::*;
 pub mod address;
 pub mod ip;

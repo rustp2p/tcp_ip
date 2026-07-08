@@ -17,8 +17,19 @@ use crate::ip_stack::{NetworkTuple, TransportPacket};
 use crate::tcp::tcp_queue::{TcpOfoQueue, TcpReceiveQueue};
 
 const IP_HEADER_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
 const TCP_HEADER_LEN: usize = 20;
 pub const IP_TCP_HEADER_LEN: usize = IP_HEADER_LEN + TCP_HEADER_LEN;
+pub const IPV6_TCP_HEADER_LEN: usize = IPV6_HEADER_LEN + TCP_HEADER_LEN;
+
+/// The default MSS: the L4 payload of a full segment must fit in the MTU.
+pub(crate) const fn default_mss(mtu: u16, is_ipv4: bool) -> u16 {
+    if is_ipv4 {
+        mtu - IP_TCP_HEADER_LEN as u16
+    } else {
+        mtu - IPV6_TCP_HEADER_LEN as u16
+    }
+}
 const MAX_DIFF: u32 = u32::MAX / 2;
 const MSS_MIN: u16 = 536;
 
