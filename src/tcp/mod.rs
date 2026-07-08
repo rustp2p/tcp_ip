@@ -20,6 +20,9 @@ use crate::ip_stack::{check_ip, default_addr, validate_addr, BindAddr, IpStack, 
 use crate::tcp::sys::{ReadNotify, TcpStreamTask};
 use crate::tcp::tcb::Tcb;
 
+/// Largest chunk a single poll_write hands to the stream task, in MSS units.
+const WRITE_CHUNK_MSS_MULTIPLE: usize = 32;
+
 mod sys;
 mod tcb;
 mod tcp_queue;
@@ -528,7 +531,7 @@ impl AsyncWrite for TcpStreamWriteHalf {
         }
         match self.payload_sender.poll_reserve(cx) {
             Poll::Ready(Ok(_)) => {
-                let len = buf.len().min(self.mss * 10);
+                let len = buf.len().min(self.mss * WRITE_CHUNK_MSS_MULTIPLE);
                 let buf = &buf[..len];
                 match self.payload_sender.send_item(buf.into()) {
                     Ok(_) => {}

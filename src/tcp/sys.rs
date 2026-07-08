@@ -15,6 +15,10 @@ use tokio::time::Instant;
 use crate::ip_stack::{BindAddr, IpStack, NetworkTuple, TransportPacket};
 use crate::tcp::tcb::Tcb;
 
+/// How many queued inbound segments are processed before sending one
+/// cumulative ACK and delivering data to the application layer.
+const MAX_INBOUND_BATCH: usize = 64;
+
 #[derive(Debug)]
 pub struct TcpStreamTask {
     _bind_addr: Option<BindAddr>,
@@ -131,7 +135,7 @@ impl TcpStreamTask {
                             break;
                         }
                         count += 1;
-                        if count >= 10 {
+                        if count >= MAX_INBOUND_BATCH {
                             break;
                         }
                         if let Some(v) = self.try_recv_in() {
