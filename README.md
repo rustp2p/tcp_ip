@@ -14,7 +14,10 @@ User-space TCP/IP stack
 
 #### IPv6
 
-- In development, currently does not support any extended protocols.
+- IPv6 fragmentation and reassembly is supported (Fragment extension header, RFC 8200 §4.5).
+- Hop-by-Hop Options, Routing and Destination Options extension headers are parsed and skipped.
+- AH/ESP and extension headers located inside the fragmentable part are not supported; such packets are rejected.
+- NDP is out of scope: the stack sits on a TUN device (layer 3), so there is no link layer to discover.
 
 #### UDP
 

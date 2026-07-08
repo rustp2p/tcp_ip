@@ -257,18 +257,20 @@ pub struct IpStackRecv {
 struct IpStackRecvInner {
     mtu: u16,
     identification: u16,
+    identification_v6: u32,
     packet_receiver: Receiver<TransportPacket>,
 }
 
 impl IpStackRecv {
     pub(crate) fn new(mtu: u16, packet_receiver: Receiver<TransportPacket>) -> Self {
-        let identification = std::time::SystemTime::now()
+        let millis = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|v| (v.as_millis() & 0xFFFF) as u16)
+            .map(|v| v.as_millis())
             .unwrap_or(0);
         let inner = IpStackRecvInner {
             mtu,
-            identification,
+            identification: (millis & 0xFFFF) as u16,
+            identification_v6: (millis & 0xFFFF_FFFF) as u32,
             packet_receiver,
         };
         Self {
@@ -303,11 +305,11 @@ struct IdKey {
     pub src: IpAddr,
     pub dst: IpAddr,
     pub protocol: IpNextHeaderProtocol,
-    pub identification: u16,
+    pub identification: u32,
 }
 
 impl IdKey {
-    fn new(src: IpAddr, dst: IpAddr, protocol: IpNextHeaderProtocol, identification: u16) -> Self {
+    fn new(src: IpAddr, dst: IpAddr, protocol: IpNextHeaderProtocol, identification: u32) -> Self {
         Self {
             src,
             dst,
@@ -534,15 +536,20 @@ impl IpStackSend {
         payload: BytesMut,
     ) -> io::Result<()> {
         let network_tuple = convert_ip_payload_network_tuple(protocol, src_ip, dest_ip, &payload)?;
-        let mut sender = match protocol {
-            IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
-            IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
-            _ => None,
-        };
-        if sender.is_none() {
-            sender = self.get_raw_sender(protocol, &network_tuple);
+        if let Some(sender) = self.get_sender(protocol, &network_tuple) {
+            _ = sender.send(TransportPacket::new(payload, network_tuple)).await;
         }
-        if let Some(sender) = sender {
+        Ok(())
+    }
+    pub async fn send_ipv6_payload(
+        &self,
+        protocol: IpNextHeaderProtocol,
+        src_ip: Ipv6Addr,
+        dest_ip: Ipv6Addr,
+        payload: BytesMut,
+    ) -> io::Result<()> {
+        let network_tuple = convert_ip_payload_network_tuple_v6(protocol, src_ip, dest_ip, &payload)?;
+        if let Some(sender) = self.get_sender(protocol, &network_tuple) {
             _ = sender.send(TransportPacket::new(payload, network_tuple)).await;
         }
         Ok(())
@@ -583,15 +590,7 @@ impl IpStackSend {
                 let Some(network_tuple) = self.prepare_ipv4_fragments(&packet, id_key)? else {
                     return Ok(());
                 };
-                let mut sender = match packet.get_next_level_protocol() {
-                    IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
-                    IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
-                    _ => None,
-                };
-                if sender.is_none() {
-                    sender = self.get_raw_sender(packet.get_next_level_protocol(), &network_tuple);
-                }
-                if let Some(sender) = sender {
+                if let Some(sender) = self.get_sender(packet.get_next_level_protocol(), &network_tuple) {
                     let rs = self.transmit_ip_packet(sender, packet, id_key, network_tuple).await;
                     if rs.is_err() {
                         self.clear_fragment_cache(&id_key);
@@ -606,23 +605,64 @@ impl IpStackSend {
                 let Some(packet) = Ipv6Packet::new(buf) else {
                     return Err(io::Error::from(io::ErrorKind::InvalidInput));
                 };
-                // todo Need to handle fragmentation, routing, and other header information.
-                let network_tuple = self.prepare_ipv6_fragments(&packet)?;
-                let mut sender = match packet.get_next_header() {
-                    IpNextHeaderProtocols::Tcp => self.get_tcp_sender(&network_tuple),
-                    IpNextHeaderProtocols::Udp => self.get_udp_sender(&network_tuple),
-                    _ => None,
+                let total_length = 40 + packet.get_payload_length() as usize;
+                if buf.len() < total_length {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ipv6 packet length"));
+                }
+                let Some(packet) = Ipv6Packet::new(&buf[..total_length]) else {
+                    return Err(io::Error::from(io::ErrorKind::InvalidInput));
                 };
-                if sender.is_none() {
-                    sender = self.get_raw_sender(packet.get_next_header(), &network_tuple);
+                let Some(info) = crate::ipv6::walk_extension_headers(packet.get_next_header(), packet.payload())? else {
+                    // No Next Header: nothing to deliver.
+                    return Ok(());
+                };
+                let l4_payload = &packet.payload()[info.payload_offset..];
+                match info.fragment {
+                    Some(ref fragment) if fragment.is_segmented() => {
+                        let id_key = convert_id_key_v6(&packet, info.protocol, fragment.identification);
+                        let Some(network_tuple) = self.prepare_ipv6_fragments(&packet, info.protocol, fragment, id_key, l4_payload)? else {
+                            return Ok(());
+                        };
+                        if let Some(sender) = self.get_sender(info.protocol, &network_tuple) {
+                            let rs = self
+                                .transmit_ipv6_fragment(sender, fragment, id_key, network_tuple, l4_payload)
+                                .await;
+                            if rs.is_err() {
+                                self.clear_fragment_cache(&id_key);
+                            }
+                            rs
+                        } else {
+                            self.clear_fragment_cache(&id_key);
+                            Ok(())
+                        }
+                    }
+                    _ => {
+                        let network_tuple =
+                            convert_ip_payload_network_tuple_v6(info.protocol, packet.get_source(), packet.get_destination(), l4_payload)?;
+                        if let Some(fragment) = &info.fragment {
+                            // An atomic fragment: confirm that the id is not occupied.
+                            self.clear_fragment_cache(&convert_id_key_v6(&packet, info.protocol, fragment.identification));
+                        }
+                        if !self.validate_l4_checksum(l4_payload, network_tuple) {
+                            return Ok(());
+                        }
+                        if let Some(sender) = self.get_sender(info.protocol, &network_tuple) {
+                            _ = sender.send(TransportPacket::new(l4_payload.into(), network_tuple)).await;
+                        }
+                        Ok(())
+                    }
                 }
-                if let Some(sender) = sender {
-                    _ = sender.send(TransportPacket::new(packet.payload().into(), network_tuple)).await;
-                }
-                Ok(())
             }
             _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
         }
+    }
+    fn get_sender(&self, protocol: IpNextHeaderProtocol, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
+        let sender = match protocol {
+            IpNextHeaderProtocols::Tcp => self.get_tcp_sender(network_tuple),
+            IpNextHeaderProtocols::Udp => self.get_udp_sender(network_tuple),
+            _ => None,
+        };
+        sender.or_else(|| self.get_raw_sender(protocol, network_tuple))
     }
     fn get_tcp_sender(&self, network_tuple: &NetworkTuple) -> Option<SenderBox<TransportPacket>> {
         let stack = &self.ip_stack.inner;
@@ -699,7 +739,7 @@ impl IpStackSend {
         let segmented = more_fragments || offset > 0;
         let buf = if segmented {
             // merge ip fragments
-            if let Some(buf) = self.merge_ip_fragments(&packet, id_key, network_tuple)? {
+            if let Some(buf) = self.merge_fragments((&packet).into(), !more_fragments, id_key, network_tuple)? {
                 buf
             } else {
                 // Need to wait for all shards to arrive
@@ -716,12 +756,36 @@ impl IpStackSend {
         _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
         Ok(())
     }
+    async fn transmit_ipv6_fragment(
+        &self,
+        sender: SenderBox<TransportPacket>,
+        fragment: &crate::ipv6::Ipv6FragmentInfo,
+        id_key: IdKey,
+        network_tuple: NetworkTuple,
+        l4_payload: &[u8],
+    ) -> io::Result<()> {
+        let ip_fragment = IpFragment {
+            offset: fragment.offset,
+            payload: l4_payload.into(),
+        };
+        let Some(buf) = self.merge_fragments(ip_fragment, !fragment.more_fragments, id_key, network_tuple)? else {
+            // Need to wait for all shards to arrive
+            return Ok(());
+        };
+        if !self.validate_l4_checksum(&buf, network_tuple) {
+            return Ok(());
+        }
+        _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
+        Ok(())
+    }
     fn validate_l4_checksum(&self, payload: &[u8], network_tuple: NetworkTuple) -> bool {
         if !self.ip_stack.config.validate_checksums {
             return true;
         }
-        let (IpAddr::V4(src), IpAddr::V4(dst)) = (network_tuple.src.ip(), network_tuple.dst.ip()) else {
-            return true;
+        let expected_checksum = |skipword: usize, protocol: IpNextHeaderProtocol| match (network_tuple.src.ip(), network_tuple.dst.ip()) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => pnet_packet::util::ipv4_checksum(payload, skipword, &[], &src, &dst, protocol),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => pnet_packet::util::ipv6_checksum(payload, skipword, &[], &src, &dst, protocol),
+            (_, _) => 0,
         };
         match network_tuple.protocol {
             IpNextHeaderProtocols::Tcp => {
@@ -729,7 +793,7 @@ impl IpStackSend {
                     log::debug!("drop tcp packet with invalid header");
                     return false;
                 };
-                let checksum = pnet_packet::util::ipv4_checksum(payload, 8, &[], &src, &dst, IpNextHeaderProtocols::Tcp);
+                let checksum = expected_checksum(8, IpNextHeaderProtocols::Tcp);
                 if checksum != tcp_packet.get_checksum() {
                     log::debug!(
                         "drop tcp packet with invalid checksum: expected={checksum:#06x} actual={:#06x}",
@@ -745,9 +809,15 @@ impl IpStackSend {
                     return false;
                 };
                 if udp_packet.get_checksum() == 0 {
-                    return true;
+                    // A zero checksum means "not computed" for IPv4,
+                    // but is illegal for IPv6 (RFC 8200 §8.1).
+                    if network_tuple.src.is_ipv4() {
+                        return true;
+                    }
+                    log::debug!("drop udp packet with zero checksum over ipv6");
+                    return false;
                 }
-                let checksum = pnet_packet::util::ipv4_checksum(payload, 3, &[], &src, &dst, IpNextHeaderProtocols::Udp);
+                let checksum = expected_checksum(3, IpNextHeaderProtocols::Udp);
                 if checksum != udp_packet.get_checksum() {
                     log::debug!(
                         "drop udp packet with invalid checksum: expected={checksum:#06x} actual={:#06x}",
@@ -782,42 +852,84 @@ impl IpStackSend {
                 // Perhaps the first IP segment has not yet arrived,
                 // so the network tuple cannot be obtained.
                 let last_fragment = ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
+                if last_fragment {
+                    p.last_offset.replace(ip_packet.get_fragment_offset() << 3);
+                }
                 p.add_fragment(ip_packet.into(), last_fragment)?;
                 return Ok(None);
             }
         };
         Ok(Some(network_tuple))
     }
-    fn prepare_ipv6_fragments(&self, ip_packet: &Ipv6Packet<'_>) -> io::Result<NetworkTuple> {
-        match ip_packet.get_next_header() {
-            IpNextHeaderProtocols::Ipv6Frag
-            | IpNextHeaderProtocols::Ipv6Route
-            | IpNextHeaderProtocols::Ipv6Opts
-            | IpNextHeaderProtocols::Ipv6NoNxt => {
-                // todo Handle IP fragmentation.
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "ipv6 option"));
+    fn prepare_ipv6_fragments(
+        &self,
+        ip_packet: &Ipv6Packet<'_>,
+        protocol: IpNextHeaderProtocol,
+        fragment: &crate::ipv6::Ipv6FragmentInfo,
+        id_key: IdKey,
+        l4_payload: &[u8],
+    ) -> io::Result<Option<NetworkTuple>> {
+        let network_tuple = if fragment.offset == 0 || (protocol != IpNextHeaderProtocols::Udp && protocol != IpNextHeaderProtocols::Tcp) {
+            // No segmentation or the first segmentation
+            convert_ip_payload_network_tuple_v6(protocol, ip_packet.get_source(), ip_packet.get_destination(), l4_payload)?
+        } else {
+            let mut guard = self.ident_fragments_map.lock();
+            if !guard.contains_key(&id_key) && guard.len() >= MAX_FRAGMENT_ENTRIES {
+                log::debug!("drop ipv6 fragment: fragment cache full");
+                return Ok(None);
             }
-            _ => {}
-        }
-        convert_network_tuple_v6(ip_packet)
+            let p = guard.entry(id_key).or_default();
+
+            if let Some(v) = p.network_tuple {
+                v
+            } else {
+                // Perhaps the first IP segment has not yet arrived,
+                // so the network tuple cannot be obtained.
+                let last_fragment = !fragment.more_fragments;
+                if last_fragment {
+                    p.last_offset.replace(fragment.offset);
+                }
+                p.add_fragment(
+                    IpFragment {
+                        offset: fragment.offset,
+                        payload: l4_payload.into(),
+                    },
+                    last_fragment,
+                )?;
+                return Ok(None);
+            }
+        };
+        Ok(Some(network_tuple))
     }
-    fn merge_ip_fragments(&self, ip_packet: &Ipv4Packet<'_>, id_key: IdKey, network_tuple: NetworkTuple) -> io::Result<Option<BytesMut>> {
+    fn merge_fragments(
+        &self,
+        fragment: IpFragment,
+        last_fragment: bool,
+        id_key: IdKey,
+        network_tuple: NetworkTuple,
+    ) -> io::Result<Option<BytesMut>> {
         let mut map = self.ident_fragments_map.lock();
         if !map.contains_key(&id_key) && map.len() >= MAX_FRAGMENT_ENTRIES {
-            log::debug!("drop ipv4 fragment: fragment cache full");
+            log::debug!("drop ip fragment: fragment cache full");
             return Ok(None);
         }
         let ip_fragments = map
             .entry(id_key)
-            .and_modify(|p| p.update_time())
+            .and_modify(|p| {
+                p.update_time();
+                // Fragments buffered before the first one arrived leave the
+                // tuple unresolved; record it so later fragments can use it.
+                if p.network_tuple.is_none() {
+                    p.network_tuple.replace(network_tuple);
+                }
+            })
             .or_insert_with(|| IpFragments::new(network_tuple));
 
-        let last_fragment = ip_packet.get_flags() & Ipv4Flags::MoreFragments != Ipv4Flags::MoreFragments;
-        let offset = ip_packet.get_fragment_offset() << 3;
+        let offset = fragment.offset;
         if last_fragment {
             ip_fragments.last_offset.replace(offset);
         }
-        ip_fragments.add_fragment(ip_packet.into(), last_fragment)?;
+        ip_fragments.add_fragment(fragment, last_fragment)?;
 
         if ip_fragments.is_complete() {
             //This place cannot be None
@@ -893,7 +1005,7 @@ impl IpStackRecvInner {
         }
         if let Some(packet) = self.packet_receiver.recv().await {
             match (packet.network_tuple.src.is_ipv6(), packet.network_tuple.dst.is_ipv6()) {
-                (true, true) => self.wrap_in_ipv6(bufs, sizes, packet),
+                (true, true) => self.split_ipv6_packet(bufs, sizes, packet),
                 (false, false) => self.split_ip_packet(bufs, sizes, packet),
                 (_, _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "address error")),
             }
@@ -901,39 +1013,78 @@ impl IpStackRecvInner {
             Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"))
         }
     }
-    fn wrap_in_ipv6<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
-        let buf = bufs[0].as_mut();
-        let total_length = 40 + packet.buf.len();
-        if buf.len() < total_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bufs[0] too short.{total_length}>{:?}", buf.len()),
-            ));
+    fn split_ipv6_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
+        const IPV6_HEADER_SIZE: usize = 40;
+        const FRAGMENT_HEADER_SIZE: usize = 8;
+        let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (packet.network_tuple.src.ip(), packet.network_tuple.dst.ip()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
+        };
+        let protocol = packet.network_tuple.protocol;
+        let mtu = self.mtu as usize;
+
+        let write_ipv6_header = |buf: &mut [u8], next_header: IpNextHeaderProtocol, payload_length: usize| {
+            buf[0] = 6 << 4; // Version (6) + Traffic Class
+            buf[1..4].fill(0); // Traffic Class + Flow Label
+            buf[4..6].copy_from_slice(&(payload_length as u16).to_be_bytes());
+            buf[6] = next_header.0;
+            buf[7] = 64; // Hop Limit
+            buf[8..24].copy_from_slice(&src_ip.octets());
+            buf[24..40].copy_from_slice(&dst_ip.octets());
+        };
+
+        if IPV6_HEADER_SIZE + packet.buf.len() <= mtu {
+            let total_length = IPV6_HEADER_SIZE + packet.buf.len();
+            let buf = bufs[0].as_mut();
+            if buf.len() < total_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("bufs[0] too short.{total_length}>{:?}", buf.len()),
+                ));
+            }
+            write_ipv6_header(buf, protocol, packet.buf.len());
+            buf[IPV6_HEADER_SIZE..total_length].copy_from_slice(&packet.buf);
+            sizes[0] = total_length;
+            return Ok(1);
         }
-        let src_ip = match packet.network_tuple.src.ip() {
-            IpAddr::V6(ip) => ip,
-            IpAddr::V4(_) => unimplemented!(),
-        };
-        let dst_ip = match packet.network_tuple.dst.ip() {
-            IpAddr::V6(ip) => ip,
-            IpAddr::V4(_) => unimplemented!(),
-        };
-        // 创建一个可变的IPv6数据包
-        let Some(mut ipv6_packet) = pnet_packet::ipv6::MutableIpv6Packet::new(&mut buf[..total_length]) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "ipv6 data error"));
-        };
-        ipv6_packet.set_version(6);
-        ipv6_packet.set_traffic_class(0);
-        ipv6_packet.set_flow_label(0);
-        ipv6_packet.set_payload_length(packet.buf.len() as u16); // 设置负载长度
-        ipv6_packet.set_next_header(packet.network_tuple.protocol);
-        ipv6_packet.set_hop_limit(64);
-        ipv6_packet.set_source(src_ip);
-        ipv6_packet.set_destination(dst_ip);
-        // 添加负载数据
-        ipv6_packet.set_payload(&packet.buf);
-        sizes[0] = total_length;
-        Ok(1)
+        // The payload exceeds the MTU: split it across Fragment extension headers (RFC 8200 §4.5).
+        self.identification_v6 = self.identification_v6.wrapping_sub(1);
+        let identification = self.identification_v6;
+        let max_fragment_data = (mtu - IPV6_HEADER_SIZE - FRAGMENT_HEADER_SIZE) & !0b111;
+        let mut offset = 0;
+        let mut total_packets = 0;
+
+        while offset < packet.buf.len() {
+            let remaining = packet.buf.len() - offset;
+            let fragment_size = remaining.min(max_fragment_data);
+            let total_length = IPV6_HEADER_SIZE + FRAGMENT_HEADER_SIZE + fragment_size;
+            if total_packets >= bufs.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs too short"));
+            }
+            let buf = bufs[total_packets].as_mut();
+            if total_length > buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("bufs[{total_packets}] too short.{total_length}>{:?}", buf.len()),
+                ));
+            }
+            let more_fragments = remaining > fragment_size;
+            assert_eq!(offset & 0b111, 0, "Offset must be a multiple of 8");
+            let offset_flags = (offset as u16 & !0b111) | more_fragments as u16;
+
+            write_ipv6_header(buf, IpNextHeaderProtocols::Ipv6Frag, FRAGMENT_HEADER_SIZE + fragment_size);
+            let fragment_header = &mut buf[IPV6_HEADER_SIZE..IPV6_HEADER_SIZE + FRAGMENT_HEADER_SIZE];
+            fragment_header[0] = protocol.0;
+            fragment_header[1] = 0; // Reserved
+            fragment_header[2..4].copy_from_slice(&offset_flags.to_be_bytes());
+            fragment_header[4..8].copy_from_slice(&identification.to_be_bytes());
+
+            let data_start = IPV6_HEADER_SIZE + FRAGMENT_HEADER_SIZE;
+            buf[data_start..total_length].copy_from_slice(&packet.buf[offset..offset + fragment_size]);
+            offset += fragment_size;
+            sizes[total_packets] = total_length;
+            total_packets += 1;
+        }
+        Ok(total_packets)
     }
     fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
         let mtu = self.mtu;
@@ -945,13 +1096,8 @@ impl IpStackRecvInner {
         const IPV4_HEADER_SIZE: usize = 20; // IPv4 header fixed size
         let max_payload_size = mtu as usize - IPV4_HEADER_SIZE;
         let max_payload_size_8 = max_payload_size & !0b111;
-        let src_ip = match packet.network_tuple.src.ip() {
-            IpAddr::V4(ip) => ip,
-            IpAddr::V6(_) => unimplemented!(),
-        };
-        let dst_ip = match packet.network_tuple.dst.ip() {
-            IpAddr::V4(ip) => ip,
-            IpAddr::V6(_) => unimplemented!(),
+        let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (packet.network_tuple.src.ip(), packet.network_tuple.dst.ip()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
         };
         let protocol = packet.network_tuple.protocol.0;
 
@@ -1062,7 +1208,7 @@ impl IpFragments {
     }
     fn add_fragment(&mut self, ip_fragment: IpFragment, last_fragment: bool) -> io::Result<()> {
         if self.bufs.iter().any(|fragment| fragment.offset == ip_fragment.offset) {
-            log::debug!("ignore duplicate ipv4 fragment at offset {}", ip_fragment.offset);
+            log::debug!("ignore duplicate ip fragment at offset {}", ip_fragment.offset);
             return Ok(());
         }
         if self.bufs.len() >= MAX_FRAGMENTS_PER_PACKET {
@@ -1121,20 +1267,21 @@ fn convert_ip_payload_network_tuple(
     let network_tuple = NetworkTuple::new(src_addr.into(), dest_addr.into(), protocol);
     Ok(network_tuple)
 }
-fn convert_network_tuple_v6(packet: &Ipv6Packet) -> io::Result<NetworkTuple> {
-    let src_ip = packet.get_source();
-    let dest_ip = packet.get_destination();
-    let protocol = packet.get_next_header();
-
+fn convert_ip_payload_network_tuple_v6(
+    protocol: IpNextHeaderProtocol,
+    src_ip: Ipv6Addr,
+    dest_ip: Ipv6Addr,
+    payload: &[u8],
+) -> io::Result<NetworkTuple> {
     let (src_port, dest_port) = match protocol {
         IpNextHeaderProtocols::Tcp => {
-            let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(packet.payload()) else {
+            let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(payload) else {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             };
             (tcp_packet.get_source(), tcp_packet.get_destination())
         }
         IpNextHeaderProtocols::Udp => {
-            let Some(udp_packet) = pnet_packet::udp::UdpPacket::new(packet.payload()) else {
+            let Some(udp_packet) = pnet_packet::udp::UdpPacket::new(payload) else {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             };
             (udp_packet.get_source(), udp_packet.get_destination())
@@ -1153,7 +1300,16 @@ fn convert_id_key(packet: &Ipv4Packet) -> IdKey {
     let dest_ip = packet.get_destination();
     let protocol = packet.get_next_level_protocol();
     let identification = packet.get_identification();
-    IdKey::new(src_ip.into(), dest_ip.into(), protocol, identification)
+    IdKey::new(src_ip.into(), dest_ip.into(), protocol, identification as u32)
+}
+
+fn convert_id_key_v6(packet: &Ipv6Packet, protocol: IpNextHeaderProtocol, identification: u32) -> IdKey {
+    IdKey::new(
+        packet.get_source().into(),
+        packet.get_destination().into(),
+        protocol,
+        identification,
+    )
 }
 
 enum SenderBox<T> {
