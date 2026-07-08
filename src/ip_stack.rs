@@ -425,6 +425,8 @@ struct IpStackRecvInner {
     identification: u16,
     identification_v6: u32,
     packet_receiver: Receiver<TransportPacket>,
+    /// A packet taken from the channel that did not fit the caller's buffers.
+    pending: Option<TransportPacket>,
 }
 
 impl IpStackRecv {
@@ -439,6 +441,7 @@ impl IpStackRecv {
             identification: (millis & 0xFFFF) as u16,
             identification_v6: (millis & 0xFFFF_FFFF) as u32,
             packet_receiver,
+            pending: None,
         };
         Self {
             inner,
@@ -1171,17 +1174,69 @@ impl IpStackRecvInner {
         if bufs.len() != sizes.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bufs.len!=sizes.len"));
         }
-        if let Some(packet) = self.packet_receiver.recv().await {
-            match (packet.network_tuple.src.is_ipv6(), packet.network_tuple.dst.is_ipv6()) {
-                (true, true) => self.split_ipv6_packet(bufs, sizes, packet),
-                (false, false) => self.split_ip_packet(bufs, sizes, packet),
+        let mut packet = if let Some(packet) = self.pending.take() {
+            packet
+        } else if let Some(packet) = self.packet_receiver.recv().await {
+            packet
+        } else {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"));
+        };
+        let mut total = 0;
+        loop {
+            // Conservative estimate; only used to stop batching, the first
+            // packet is always attempted so single-packet semantics are kept.
+            if total > 0 && self.fragments_needed(&packet) > bufs.len() - total {
+                self.pending = Some(packet);
+                break;
+            }
+            let rs = match (packet.network_tuple.src.is_ipv6(), packet.network_tuple.dst.is_ipv6()) {
+                (true, true) => self.split_ipv6_packet(&mut bufs[total..], &mut sizes[total..], &packet),
+                (false, false) => self.split_ip_packet(&mut bufs[total..], &mut sizes[total..], &packet),
                 (_, _) => Err(io::Error::new(io::ErrorKind::InvalidInput, "address error")),
+            };
+            match rs {
+                Ok(n) => total += n,
+                Err(e) => {
+                    if total == 0 {
+                        return Err(e);
+                    }
+                    // Deliver what was already split; the error surfaces
+                    // deterministically when this packet is retried next call.
+                    self.pending = Some(packet);
+                    break;
+                }
+            }
+            if total >= bufs.len() {
+                break;
+            }
+            // Drain whatever is already queued without waiting.
+            match self.packet_receiver.try_recv() {
+                Ok(next) => packet = next,
+                Err(_) => break,
+            }
+        }
+        Ok(total)
+    }
+    /// Upper bound of the IP packets `packet` splits into.
+    fn fragments_needed(&self, packet: &TransportPacket) -> usize {
+        let len = packet.buf.len();
+        if packet.network_tuple.src.is_ipv6() {
+            let mtu = self.ipv6_mtu as usize;
+            if 40 + len <= mtu {
+                1
+            } else {
+                len.div_ceil((mtu - 48) & !0b111)
             }
         } else {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"))
+            let mtu = self.ipv4_mtu as usize;
+            if 20 + len <= mtu {
+                1
+            } else {
+                len.div_ceil((mtu - 20) & !0b111)
+            }
         }
     }
-    fn split_ipv6_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
+    fn split_ipv6_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: &TransportPacket) -> io::Result<usize> {
         const IPV6_HEADER_SIZE: usize = 40;
         const FRAGMENT_HEADER_SIZE: usize = 8;
         let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (packet.network_tuple.src.ip(), packet.network_tuple.dst.ip()) else {
@@ -1254,7 +1309,7 @@ impl IpStackRecvInner {
         }
         Ok(total_packets)
     }
-    fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: TransportPacket) -> io::Result<usize> {
+    fn split_ip_packet<B: AsMut<[u8]>>(&mut self, bufs: &mut [B], sizes: &mut [usize], packet: &TransportPacket) -> io::Result<usize> {
         let mtu = self.ipv4_mtu;
         self.identification = self.identification.wrapping_sub(1);
         let identification = self.identification;
