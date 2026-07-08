@@ -6,7 +6,7 @@ use pnet_packet::ipv4::{Ipv4Flags, Ipv4Packet};
 use pnet_packet::ipv6::Ipv6Packet;
 use pnet_packet::Packet;
 use pnet_packet::{tcp::TcpPacket, udp::UdpPacket};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io;

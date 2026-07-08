@@ -10,7 +10,7 @@ use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::TcpFlags::{ACK, FIN, PSH, RST, SYN};
 use pnet_packet::tcp::{TcpOptionNumber, TcpOptionNumbers, TcpPacket};
 use pnet_packet::Packet;
-use rand::RngCore;
+use rand::Rng;
 
 use crate::buffer::FixedBuffer;
 use crate::ip_stack::{NetworkTuple, TransportPacket};

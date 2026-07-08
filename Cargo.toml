@@ -11,11 +11,11 @@ keywords = ["ip", "tcp", "udp", "icmp", "network"]
 [dependencies]
 bytes = "1.9"
 dashmap = "6.1"
-flume = { version = "0.11", features = ["async"] }
+flume = { version = "0.12.0", features = ["async"] }
 log = "0.4"
 parking_lot = "0.12"
 pnet_packet = "0.35"
-rand = "0.9"
+rand = "0.10.2"
 tokio = { version = "1.42", features = ["macros", "rt", "time"] }
 tokio-util = "0.7"
 num_enum = "0.7"
