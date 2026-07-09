@@ -32,6 +32,9 @@ pub struct TcpStreamTask {
     write_half_closed: bool,
     retransmission: bool,
     read_notify: ReadNotify,
+    /// The retransmission/probe/time-wait deadline used for the last wait,
+    /// to tell a delayed-ACK wake-up apart from a real timeout.
+    primary_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -87,6 +90,7 @@ impl TcpStreamTask {
             write_half_closed: false,
             retransmission: false,
             read_notify: Default::default(),
+            primary_deadline: None,
         }
     }
     pub fn read_notify(&self) -> ReadNotify {
@@ -162,7 +166,9 @@ impl TcpStreamTask {
                     self.send_packet(packet).await?;
                     self.tcb.sent_fin();
                 }
-                TaskRecvData::Timeout => {
+                // A wake-up caused only by the delayed-ACK timer must not run the
+                // retransmission/teardown logic; the due ACK is sent below.
+                TaskRecvData::Timeout if !self.ack_only_wake() => {
                     if self.tcb.no_inflight_packet() && self.tcb.limit() && self.tcb.writeable_state() {
                         if let Some(buf) = self.last_buffer.as_mut() {
                             if let Some((packet, len)) = buf.first().copied().and_then(|probe_byte| self.tcb.write_probe(&[probe_byte])) {
@@ -196,6 +202,7 @@ impl TcpStreamTask {
                         return Ok(());
                     }
                 }
+                TaskRecvData::Timeout => {}
                 TaskRecvData::ReadNotify => {
                     self.push_application_layer();
                     self.try_send_ack().await?;
@@ -203,7 +210,6 @@ impl TcpStreamTask {
             }
             self.retransmission = self.try_retransmission().await?;
             self.try_send_ack().await?;
-            self.tcb.perform_post_ack_action();
             if !self.read_half_closed() && self.tcb.cannot_read() {
                 self.close_read();
             }
@@ -318,18 +324,43 @@ impl TcpStreamTask {
         Ok(false)
     }
     async fn try_send_ack(&mut self) -> io::Result<()> {
-        if self.tcb.need_ack() {
-            let packet = self.tcb.ack_packet();
+        if let Some(packet) = self.tcb.poll_ack(std::time::Instant::now()) {
             self.ip_stack.send_packet(packet).await?;
+            self.tcb.perform_post_ack_action();
         }
         Ok(())
     }
+    /// The last wake-up came from the delayed-ACK timer only: no primary
+    /// (retransmission/probe/time-wait) deadline was due yet.
+    fn ack_only_wake(&self) -> bool {
+        self.primary_deadline.is_none_or(|deadline| Instant::now() < deadline)
+    }
 
     async fn recv_data(&mut self) -> TaskRecvData {
-        let deadline = if let Some(v) = self.tcb.time_wait() {
+        let primary_deadline = if let Some(v) = self.tcb.time_wait() {
             Some(v.into())
+        } else if let Some(v) = self.tcb.write_timeout() {
+            Some(v.into())
+        } else if self.write_half_closed {
+            if self.tcb.fin_acknowledged() {
+                Some(Instant::now().add(self.ip_stack.config.tcp_config().time_wait_timeout))
+            } else {
+                Some(Instant::now().add(self.tcb.rto()))
+            }
+        } else if self.only_recv_in() {
+            // Sending cannot make progress (e.g. the peer advertised a zero window
+            // and nothing is inflight). Stop draining the application layer so that
+            // `last_buffer` is not overwritten, and wake up periodically to retry
+            // flushing, acting as a simple zero-window probe timer.
+            Some(Instant::now().add(self.tcb.rto()))
         } else {
-            self.tcb.write_timeout().map(|v| v.into())
+            None
+        };
+        self.primary_deadline = primary_deadline;
+        let ack_deadline = self.tcb.ack_deadline().map(Instant::from);
+        let deadline = match (primary_deadline, ack_deadline) {
+            (Some(primary), Some(ack)) => Some(primary.min(ack)),
+            (primary, ack) => primary.or(ack),
         };
 
         if let Some(deadline) = deadline {
@@ -338,19 +369,6 @@ impl TcpStreamTask {
             } else {
                 self.recv_timeout_at(deadline).await
             }
-        } else if self.write_half_closed {
-            if self.tcb.fin_acknowledged() {
-                let timeout_at = Instant::now().add(self.ip_stack.config.tcp_config().time_wait_timeout);
-                self.recv_in_timeout_at(timeout_at).await
-            } else {
-                self.recv_in_timeout(self.tcb.rto()).await
-            }
-        } else if self.only_recv_in() {
-            // Sending cannot make progress (e.g. the peer advertised a zero window
-            // and nothing is inflight). Stop draining the application layer so that
-            // `last_buffer` is not overwritten, and wake up periodically to retry
-            // flushing, acting as a simple zero-window probe timer.
-            self.recv_in_timeout(self.tcb.rto()).await
         } else {
             self.recv().await
         }
@@ -398,10 +416,6 @@ impl TcpStreamTask {
             }
         }
     }
-    async fn recv_in_timeout(&mut self, duration: Duration) -> TaskRecvData {
-        self.recv_in_timeout_at(Instant::now().add(duration)).await
-    }
-
     fn try_recv_in(&mut self) -> Option<Bytes> {
         self.packet_receiver.try_recv().map(|v| v.buf).ok()
     }

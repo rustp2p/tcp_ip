@@ -781,6 +781,38 @@ impl Tcb {
     pub fn need_ack(&self) -> bool {
         self.last_snd_wnd != self.recv_window() || self.snd_ack != self.last_snd_ack || self.requires_ack_repeat
     }
+    /// A due ACK that must not be delayed (RFC 1122): duplicate/out-of-order
+    /// feedback for the peer's fast retransmit, two full segments of
+    /// unacknowledged data, a window reopening, or connection teardown.
+    fn ack_urgent(&self) -> bool {
+        self.requires_ack_repeat
+            || self.state != TcpState::Established
+            || (self.snd_ack - self.last_snd_ack).0 as usize >= 2 * self.mss as usize
+            || (self.last_snd_wnd == 0 && self.recv_window() > 0)
+    }
+    /// Returns the ACK to send now, or `None` when no ACK is due or the ACK
+    /// is being delayed (arming `ack_deadline` on first deferral).
+    pub fn poll_ack(&mut self, now: Instant) -> Option<TransportPacket> {
+        if !self.need_ack() {
+            return None;
+        }
+        if let Some(delay) = self.ack_delay {
+            if !self.ack_urgent() {
+                match self.ack_deadline {
+                    None => {
+                        self.ack_deadline = Some(now + delay);
+                        return None;
+                    }
+                    Some(deadline) if now < deadline => return None,
+                    _ => {}
+                }
+            }
+        }
+        Some(self.ack_packet())
+    }
+    pub fn ack_deadline(&self) -> Option<Instant> {
+        self.ack_deadline
+    }
     pub fn recv_window(&self) -> u16 {
         let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
@@ -813,6 +845,7 @@ impl Tcb {
         self.last_snd_wnd = self.recv_window();
         self.last_snd_ack = self.snd_ack;
         self.requires_ack_repeat = false;
+        self.ack_deadline = None;
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
         let ack = AckNum::from(tcp_packet.get_acknowledgement());
@@ -1373,5 +1406,68 @@ mod sack_tests {
         assert_eq!(payload.len(), 8);
         assert_eq!(u32::from_be_bytes(payload[0..4].try_into().unwrap()), 500);
         assert_eq!(u32::from_be_bytes(payload[4..8].try_into().unwrap()), 600);
+    }
+}
+
+#[cfg(test)]
+mod delayed_ack_tests {
+    use super::*;
+
+    fn test_tcb(ack_delay: Option<Duration>) -> Tcb {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let config = TcpConfig {
+            ack_delay,
+            ..Default::default()
+        };
+        let mut tcb = Tcb::new_listen(local, peer, config);
+        tcb.state = TcpState::Established;
+        tcb.mss = 1000;
+        // Pretend 100 bytes arrived since the last sent ACK
+        tcb.snd_ack = SeqNum(100);
+        tcb.perform_post_ack_action();
+        tcb.snd_ack = SeqNum(200);
+        tcb
+    }
+
+    #[test]
+    fn immediate_mode_sends_at_once() {
+        let mut tcb = test_tcb(None);
+        assert!(tcb.poll_ack(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn delayed_mode_defers_until_deadline() {
+        let mut tcb = test_tcb(Some(Duration::from_millis(40)));
+        let start = Instant::now();
+        assert!(tcb.poll_ack(start).is_none(), "first poll arms the timer");
+        let deadline = tcb.ack_deadline().expect("deadline must be armed");
+        assert_eq!(deadline, start + Duration::from_millis(40));
+        assert!(tcb.poll_ack(start + Duration::from_millis(39)).is_none());
+        assert!(tcb.poll_ack(deadline).is_some(), "due at the deadline");
+    }
+
+    #[test]
+    fn two_full_segments_bypass_the_delay() {
+        let mut tcb = test_tcb(Some(Duration::from_millis(40)));
+        tcb.snd_ack = SeqNum(200 + 2 * 1000);
+        assert!(tcb.poll_ack(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn out_of_order_data_bypasses_the_delay() {
+        let mut tcb = test_tcb(Some(Duration::from_millis(40)));
+        tcb.requires_ack_repeat = true;
+        assert!(tcb.poll_ack(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn post_ack_action_clears_the_deadline() {
+        let mut tcb = test_tcb(Some(Duration::from_millis(40)));
+        assert!(tcb.poll_ack(Instant::now()).is_none());
+        assert!(tcb.ack_deadline().is_some());
+        tcb.perform_post_ack_action();
+        assert!(tcb.ack_deadline().is_none());
+        assert!(tcb.poll_ack(Instant::now()).is_none(), "nothing left to ack");
     }
 }
