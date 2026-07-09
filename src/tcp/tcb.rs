@@ -505,15 +505,24 @@ impl Tcb {
     }
     fn create_transport_packet(&self, flags: u8, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, self.snd_seq.0, self.snd_ack.0, payload, None);
-        TransportPacket::new(data.freeze(), NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
     }
     fn create_option_transport_packet(&self, flags: u8, payload: &[u8], options: Option<&[u8]>) -> TransportPacket {
         let data = self.create_packet(flags, self.snd_seq.0, self.snd_ack.0, payload, options);
-        TransportPacket::new(data.freeze(), NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
     }
     fn create_transport_packet_seq(&self, flags: u8, seq: u32, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, seq, self.snd_ack.0, payload, None);
-        TransportPacket::new(data.freeze(), NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
     }
     /// Builds a data segment's wire bytes exactly once: the returned
     /// `TransportPacket` and the inflight payload share one allocation.
@@ -1053,7 +1062,10 @@ pub fn create_transport_packet_raw(
     payload: &[u8],
 ) -> TransportPacket {
     let data = create_packet_raw(local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload, None);
-    TransportPacket::new(data.freeze(), NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp))
+    TransportPacket::new(
+        data.freeze(),
+        NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1094,12 +1106,8 @@ pub fn create_packet_raw(
     }
     bytes.extend_from_slice(payload);
     let checksum = match (local_addr.ip(), peer_addr.ip()) {
-        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
-            crate::checksum::ipv4_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
-        }
-        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
-            crate::checksum::ipv6_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
-        }
+        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => crate::checksum::ipv4_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp),
+        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => crate::checksum::ipv6_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp),
         (_, _) => {
             unreachable!()
         }
