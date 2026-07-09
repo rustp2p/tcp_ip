@@ -140,7 +140,7 @@ impl UdpSocket {
         data[6..8].copy_from_slice(&checksum.to_be_bytes());
         let network_tuple = NetworkTuple::new(src, dst, IpNextHeaderProtocols::Udp);
 
-        let packet = TransportPacket::new(data, network_tuple);
+        let packet = TransportPacket::new(data.freeze(), network_tuple);
         self.ip_stack.send_packet(packet).await?;
         Ok(buf.len())
     }

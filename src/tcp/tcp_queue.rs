@@ -1,18 +1,18 @@
 use crate::tcp::tcb::UnreadPacket;
-use bytes::BytesMut;
+use bytes::Bytes;
 use std::collections::{BTreeMap, LinkedList};
 
 #[derive(Debug, Default)]
 pub(crate) struct TcpReceiveQueue {
     total_bytes: usize,
-    queue: LinkedList<BytesMut>,
+    queue: LinkedList<Bytes>,
 }
 impl TcpReceiveQueue {
-    pub fn push(&mut self, elt: BytesMut) {
+    pub fn push(&mut self, elt: Bytes) {
         self.total_bytes += elt.len();
         self.queue.push_back(elt);
     }
-    pub fn pop(&mut self) -> Option<BytesMut> {
+    pub fn pop(&mut self) -> Option<Bytes> {
         if let Some(v) = self.queue.pop_front() {
             self.total_bytes -= v.len();
             Some(v)

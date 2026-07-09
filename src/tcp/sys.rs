@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -28,7 +28,7 @@ pub struct TcpStreamTask {
     application_layer_receiver: Receiver<BytesMut>,
     last_buffer: Option<BytesMut>,
     packet_receiver: Receiver<TransportPacket>,
-    application_layer_sender: Option<Sender<BytesMut>>,
+    application_layer_sender: Option<Sender<Bytes>>,
     write_half_closed: bool,
     retransmission: bool,
     read_notify: ReadNotify,
@@ -71,7 +71,7 @@ impl TcpStreamTask {
         _bind_addr: Option<BindAddr>,
         tcb: Tcb,
         ip_stack: IpStack,
-        application_layer_sender: Sender<BytesMut>,
+        application_layer_sender: Sender<Bytes>,
         application_layer_receiver: Receiver<BytesMut>,
         packet_receiver: Receiver<TransportPacket>,
     ) -> Self {
@@ -258,7 +258,7 @@ impl TcpStreamTask {
     }
     fn close_read(&mut self) {
         if let Some(sender) = self.application_layer_sender.take() {
-            _ = sender.try_send(BytesMut::new());
+            _ = sender.try_send(Bytes::new());
         }
     }
     async fn write_slice0(tcb: &mut Tcb, ip_stack: &IpStack, mut buf: &[u8]) -> io::Result<usize> {
@@ -402,7 +402,7 @@ impl TcpStreamTask {
         self.recv_in_timeout_at(Instant::now().add(duration)).await
     }
 
-    fn try_recv_in(&mut self) -> Option<BytesMut> {
+    fn try_recv_in(&mut self) -> Option<Bytes> {
         self.packet_receiver.try_recv().map(|v| v.buf).ok()
     }
 }
@@ -447,7 +447,7 @@ impl TcpStreamTask {
 }
 
 enum TaskRecvData {
-    In(BytesMut),
+    In(Bytes),
     Out(BytesMut),
     ReadNotify,
     InClose,

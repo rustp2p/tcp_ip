@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::TcpFlags::{ACK, RST, SYN};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -118,8 +118,8 @@ pub struct TcpStream {
 
 pub struct TcpStreamReadHalf {
     read_notify: ReadNotify,
-    last_buf: Option<BytesMut>,
-    payload_receiver: Receiver<BytesMut>,
+    last_buf: Option<Bytes>,
+    payload_receiver: Receiver<Bytes>,
 }
 
 pub struct TcpStreamWriteHalf {

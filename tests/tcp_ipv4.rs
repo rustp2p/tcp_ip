@@ -295,3 +295,38 @@ async fn read_half_dropped_connection_still_closes() {
     .await
     .unwrap();
 }
+
+/// Many tiny writes: each becomes its own small segment now that the send
+/// path no longer coalesces into the trailing inflight packet.
+#[tokio::test]
+async fn many_small_writes_echo() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (stack_a, stack_b) = connect_stacks(IpStackConfig::default(), false);
+        let server_addr: SocketAddr = format!("{IP_B}:8090").parse().unwrap();
+        let mut listener = TcpListener::bind(stack_b, server_addr).await.unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let received = read_to_end(&mut stream).await;
+            stream.write_all(&received).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut expected = Vec::new();
+        let mut client = client_connect(stack_a, server_addr).await;
+        for i in 0..1000usize {
+            let len = i % 100 + 1;
+            let chunk: Vec<u8> = (0..len).map(|j| (i + j) as u8).collect();
+            client.write_all(&chunk).await.unwrap();
+            expected.extend_from_slice(&chunk);
+        }
+        client.shutdown().await.unwrap();
+
+        let echoed = read_to_end(&mut client).await;
+        assert_eq!(echoed.len(), expected.len());
+        assert!(echoed == expected, "echoed data corrupted");
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}

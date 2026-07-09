@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, DashSet, Entry};
 use parking_lot::Mutex;
 use pnet_packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
@@ -707,7 +707,7 @@ impl IpStackSend {
     ) -> io::Result<()> {
         let network_tuple = convert_ip_payload_network_tuple(protocol, src_ip, dest_ip, &payload)?;
         if let Some(sender) = self.get_sender(protocol, &network_tuple) {
-            _ = sender.send(TransportPacket::new(payload, network_tuple)).await;
+            _ = sender.send(TransportPacket::new(payload.freeze(), network_tuple)).await;
         }
         Ok(())
     }
@@ -720,7 +720,7 @@ impl IpStackSend {
     ) -> io::Result<()> {
         let network_tuple = convert_ip_payload_network_tuple_v6(protocol, src_ip, dest_ip, &payload)?;
         if let Some(sender) = self.get_sender(protocol, &network_tuple) {
-            _ = sender.send(TransportPacket::new(payload, network_tuple)).await;
+            _ = sender.send(TransportPacket::new(payload.freeze(), network_tuple)).await;
         }
         Ok(())
     }
@@ -817,7 +817,9 @@ impl IpStackSend {
                             return Ok(());
                         }
                         if let Some(sender) = self.get_sender(info.protocol, &network_tuple) {
-                            _ = sender.send(TransportPacket::new(l4_payload.into(), network_tuple)).await;
+                            _ = sender
+                                .send(TransportPacket::new(Bytes::copy_from_slice(l4_payload), network_tuple))
+                                .await;
                         }
                         Ok(())
                     }
@@ -923,7 +925,7 @@ impl IpStackSend {
         if !self.validate_l4_checksum(&buf, network_tuple) {
             return Ok(());
         }
-        _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
+        _ = sender.send(TransportPacket::new(buf.freeze(), network_tuple)).await;
         Ok(())
     }
     async fn transmit_ipv6_fragment(
@@ -945,7 +947,7 @@ impl IpStackSend {
         if !self.validate_l4_checksum(&buf, network_tuple) {
             return Ok(());
         }
-        _ = sender.send(TransportPacket::new(buf, network_tuple)).await;
+        _ = sender.send(TransportPacket::new(buf.freeze(), network_tuple)).await;
         Ok(())
     }
     fn validate_l4_checksum(&self, payload: &[u8], network_tuple: NetworkTuple) -> bool {
@@ -1372,12 +1374,12 @@ impl IpStackRecvInner {
 
 #[derive(Debug)]
 pub(crate) struct TransportPacket {
-    pub buf: BytesMut,
+    pub buf: Bytes,
     pub network_tuple: NetworkTuple,
 }
 
 impl TransportPacket {
-    pub fn new(buf: BytesMut, network_tuple: NetworkTuple) -> Self {
+    pub fn new(buf: Bytes, network_tuple: NetworkTuple) -> Self {
         Self { buf, network_tuple }
     }
 }

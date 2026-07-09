@@ -141,7 +141,7 @@ impl IpSocket {
         let dst = SocketAddr::new(dst, 0);
         let network_tuple = NetworkTuple::new(src, dst, protocol);
 
-        let packet = TransportPacket::new(data, network_tuple);
+        let packet = TransportPacket::new(data.freeze(), network_tuple);
         if self.ip_stack.inner.packet_sender.send(packet).await.is_err() {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
