@@ -5,14 +5,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::{Add, Sub};
 use std::time::{Duration, Instant};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::tcp::TcpFlags::{ACK, FIN, PSH, RST, SYN};
 use pnet_packet::tcp::{TcpOptionNumber, TcpOptionNumbers, TcpPacket};
 use pnet_packet::Packet;
 use rand::Rng;
 
-use crate::buffer::FixedBuffer;
 use crate::ip_stack::{NetworkTuple, TransportPacket};
 use crate::tcp::tcp_queue::{TcpOfoQueue, TcpReceiveQueue};
 
@@ -165,7 +164,7 @@ impl SeqNum {
 pub(crate) struct UnreadPacket {
     seq: SeqNum,
     flags: u8,
-    payload: BytesMut,
+    payload: Bytes,
 }
 
 impl Eq for UnreadPacket {}
@@ -189,7 +188,7 @@ impl Ord for UnreadPacket {
 }
 
 impl UnreadPacket {
-    fn new(seq: SeqNum, flags: u8, payload: BytesMut) -> Self {
+    fn new(seq: SeqNum, flags: u8, payload: Bytes) -> Self {
         Self { seq, flags, payload }
     }
     pub(crate) fn len(&self) -> usize {
@@ -209,7 +208,7 @@ impl UnreadPacket {
     fn end(&self) -> SeqNum {
         self.seq.add_num(self.payload.len() as u32)
     }
-    fn into_bytes(self) -> BytesMut {
+    fn into_bytes(self) -> Bytes {
         self.payload
     }
 }
@@ -221,43 +220,33 @@ struct InflightPacket {
     confirmed: bool,
     sent_at: Instant,
     retransmitted: bool,
-    buf: FixedBuffer,
+    /// Zero-copy slice of the wire packet's payload.
+    payload: Bytes,
 }
 
 impl InflightPacket {
-    pub fn new(seq: SeqNum, buf: FixedBuffer) -> Self {
-        let mut packet = Self {
+    pub fn new(seq: SeqNum, payload: Bytes) -> Self {
+        Self {
             seq,
             confirmed: false,
             sent_at: Instant::now(),
             retransmitted: false,
-            buf,
-        };
-        packet.init();
-        packet
-    }
-    pub fn init(&mut self) {
-        self.buf.clear();
+            payload,
+        }
     }
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.payload.len()
     }
 
     pub fn advance(&mut self, cnt: usize) {
         self.seq.add_update(cnt as u32);
-        self.buf.advance(cnt)
+        self.payload.advance(cnt)
     }
     pub fn start(&self) -> SeqNum {
         self.seq
     }
     pub fn end(&self) -> SeqNum {
-        self.seq.add_num(self.buf.len() as u32)
-    }
-    pub fn write(&mut self, buf: &[u8]) -> usize {
-        self.buf.extend_from_slice(buf)
-    }
-    pub fn bytes(&self) -> &[u8] {
-        self.buf.bytes()
+        self.seq.add_num(self.payload.len() as u32)
     }
 }
 
@@ -368,7 +357,7 @@ impl Tcb {
             None
         }
     }
-    pub fn try_syn_received_to_established(&mut self, mut buf: BytesMut) -> bool {
+    pub fn try_syn_received_to_established(&mut self, mut buf: Bytes) -> bool {
         let Some(packet) = TcpPacket::new(&buf) else {
             self.error();
             return false;
@@ -402,7 +391,7 @@ impl Tcb {
         }
         false
     }
-    pub fn try_syn_sent_to_established(&mut self, buf: BytesMut) -> Option<TransportPacket> {
+    pub fn try_syn_sent_to_established(&mut self, buf: Bytes) -> Option<TransportPacket> {
         let packet = TcpPacket::new(&buf)?;
         let flags = packet.get_flags();
         if self.state == TcpState::SynSent && flags & RST == RST {
@@ -426,10 +415,10 @@ impl Tcb {
         None
     }
     fn init_congestion_window(&mut self) {
-        let initial_cwnd = self.mss as usize * 4;
+        // RFC 6928 initial window
+        let initial_cwnd = self.mss as usize * 10;
         let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
-        self.congestion_window
-            .init(initial_cwnd, (initial_cwnd + max_cwnd) / 2, max_cwnd, self.mss as usize);
+        self.congestion_window.init(initial_cwnd, max_cwnd, self.mss as usize);
     }
 }
 
@@ -516,15 +505,32 @@ impl Tcb {
     }
     fn create_transport_packet(&self, flags: u8, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, self.snd_seq.0, self.snd_ack.0, payload, None);
-        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
     }
     fn create_option_transport_packet(&self, flags: u8, payload: &[u8], options: Option<&[u8]>) -> TransportPacket {
         let data = self.create_packet(flags, self.snd_seq.0, self.snd_ack.0, payload, options);
-        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
     }
     fn create_transport_packet_seq(&self, flags: u8, seq: u32, payload: &[u8]) -> TransportPacket {
         let data = self.create_packet(flags, seq, self.snd_ack.0, payload, None);
-        TransportPacket::new(data, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp))
+        TransportPacket::new(
+            data.freeze(),
+            NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp),
+        )
+    }
+    /// Builds a data segment's wire bytes exactly once: the returned
+    /// `TransportPacket` and the inflight payload share one allocation.
+    fn create_data_segment(&self, flags: u8, payload: &[u8]) -> (TransportPacket, Bytes) {
+        let wire = self.create_packet(flags, self.snd_seq.0, self.snd_ack.0, payload, None).freeze();
+        let inflight_payload = wire.slice(TCP_HEADER_LEN..);
+        let packet = TransportPacket::new(wire, NetworkTuple::new(self.local_addr, self.peer_addr, IpNextHeaderProtocols::Tcp));
+        (packet, inflight_payload)
     }
 
     fn create_packet(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], options: Option<&[u8]>) -> BytesMut {
@@ -550,7 +556,7 @@ impl Tcb {
         !self.readable_state() && !self.readable()
     }
 
-    pub fn push_packet(&mut self, mut buf: BytesMut) -> Option<TransportPacket> {
+    pub fn push_packet(&mut self, mut buf: Bytes) -> Option<TransportPacket> {
         let Some(packet) = TcpPacket::new(&buf) else {
             self.error();
             return None;
@@ -589,6 +595,8 @@ impl Tcb {
                             }
                         }
                         self.snd_wnd = packet.get_window();
+                        self.congestion_window
+                            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
                     }
 
                     self.update_last_ack(&packet);
@@ -663,7 +671,7 @@ impl Tcb {
         self.rcv_wnd = 0;
         self.tcp_receive_queue.clear();
     }
-    pub fn read(&mut self) -> Option<BytesMut> {
+    pub fn read(&mut self) -> Option<Bytes> {
         self.tcp_receive_queue.pop()
     }
 
@@ -773,9 +781,11 @@ impl Tcb {
             return;
         }
         self.snd_wnd = tcp_packet.get_window();
-        self.congestion_window.on_ack();
+        self.congestion_window
+            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
+        self.congestion_window.on_ack(distance);
         self.rcv_ack = ack;
         let now = Instant::now();
         let mut rtt_candidate_seen = false;
@@ -831,10 +841,6 @@ impl Tcb {
     fn backoff_rto(&mut self) {
         self.rto = self.clamp_rto(self.rto * 2);
     }
-    fn take_send_buf(&mut self) -> Option<InflightPacket> {
-        let bytes_mut = FixedBuffer::with_capacity(self.mss as usize);
-        Some(InflightPacket::new(self.snd_seq, bytes_mut))
-    }
     pub fn write(&mut self, buf: &[u8]) -> Option<(TransportPacket, usize)> {
         let rs = self.write0(buf);
         self.init_write_timeout();
@@ -844,24 +850,16 @@ impl Tcb {
         if !self.writeable_state() || buf.is_empty() {
             return None;
         }
-        let seq = self.snd_seq.0;
-        let buf = &buf[..1];
-        let mut packet = self.take_send_buf()?;
-        let n = packet.write(buf);
-        if n == 0 {
-            return None;
-        }
-        self.inflight_packets.push_back(packet);
-        let packet = self.create_transport_packet_seq(ACK, seq, &buf[..n]);
-        self.snd_seq.add_update(n as u32);
+        let (packet, inflight_payload) = self.create_data_segment(ACK, &buf[..1]);
+        self.inflight_packets.push_back(InflightPacket::new(self.snd_seq, inflight_payload));
+        self.snd_seq.add_update(1);
         self.init_write_timeout();
-        Some((packet, n))
+        Some((packet, 1))
     }
     fn write0(&mut self, mut buf: &[u8]) -> Option<(TransportPacket, usize)> {
         if !self.writeable_state() {
             return None;
         }
-        let seq = self.snd_seq.0;
         let snd_wnd = self.send_window();
         if snd_wnd < buf.len() {
             buf = &buf[..snd_wnd];
@@ -869,25 +867,12 @@ impl Tcb {
         if buf.is_empty() {
             return None;
         }
+        let n = buf.len().min(self.mss as usize);
         let flags = if self.decelerate() { PSH | ACK } else { ACK };
-        if let Some(packet) = self.inflight_packets.back_mut() {
-            let n = packet.write(buf);
-            if n > 0 {
-                let packet = self.create_transport_packet_seq(flags, seq, &buf[..n]);
-                self.snd_seq.add_update(n as u32);
-                return Some((packet, n));
-            }
-        }
-
-        if let Some(mut packet) = self.take_send_buf() {
-            let n = packet.write(buf);
-            assert!(n > 0);
-            self.inflight_packets.push_back(packet);
-            let packet = self.create_transport_packet_seq(flags, seq, &buf[..n]);
-            self.snd_seq.add_update(n as u32);
-            return Some((packet, n));
-        }
-        None
+        let (packet, inflight_payload) = self.create_data_segment(flags, &buf[..n]);
+        self.inflight_packets.push_back(InflightPacket::new(self.snd_seq, inflight_payload));
+        self.snd_seq.add_update(n as u32);
+        Some((packet, n))
     }
     pub fn write_timeout(&self) -> Option<Instant> {
         self.write_timeout
@@ -915,7 +900,9 @@ impl Tcb {
             if packet.end() > back_seq {
                 let next_back_seq = packet.end();
                 let seq = packet.start().0;
-                let bytes = BytesMut::from(packet.bytes());
+                // Cheap refcount clone; the wire packet is rebuilt with the
+                // current ack/window and a fresh checksum
+                let bytes = packet.payload.clone();
                 packet.retransmitted = true;
                 packet.sent_at = Instant::now();
                 self.back_seq.replace(next_back_seq);
@@ -1075,7 +1062,10 @@ pub fn create_transport_packet_raw(
     payload: &[u8],
 ) -> TransportPacket {
     let data = create_packet_raw(local_addr, peer_addr, snd_seq, rcv_ack, rcv_wnd, flags, payload, None);
-    TransportPacket::new(data, NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp))
+    TransportPacket::new(
+        data.freeze(),
+        NetworkTuple::new(*local_addr, *peer_addr, IpNextHeaderProtocols::Tcp),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1116,12 +1106,8 @@ pub fn create_packet_raw(
     }
     bytes.extend_from_slice(payload);
     let checksum = match (local_addr.ip(), peer_addr.ip()) {
-        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
-            pnet_packet::util::ipv4_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
-        }
-        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
-            pnet_packet::util::ipv6_checksum(&bytes, 8, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp)
-        }
+        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => crate::checksum::ipv4_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp),
+        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => crate::checksum::ipv6_checksum(&bytes, 8, &src_ip, &dst_ip, IpNextHeaderProtocols::Tcp),
         (_, _) => {
             unreachable!()
         }
@@ -1139,17 +1125,28 @@ struct CongestionWindow {
 }
 
 impl CongestionWindow {
-    pub fn init(&mut self, initial_cwnd: usize, initial_ssthresh: usize, max_cwnd: usize, mss: usize) {
+    pub fn init(&mut self, initial_cwnd: usize, max_cwnd: usize, mss: usize) {
         self.cwnd = initial_cwnd;
-        self.ssthresh = initial_ssthresh;
+        // "Infinite" until the first loss (RFC 5681): the handshake-time peer
+        // window says nothing about path capacity
+        self.ssthresh = usize::MAX / 2;
         self.max_cwnd = max_cwnd;
         self.mss = mss;
     }
 
-    pub fn on_ack(&mut self) {
+    /// The peer's advertised window grows as its autotuning kicks in; growing
+    /// cwnd beyond the largest window ever seen is useless, but capping it at
+    /// the handshake-time value would freeze throughput.
+    pub fn update_max_cwnd(&mut self, wnd: usize) {
+        self.max_cwnd = self.max_cwnd.max(wnd);
+    }
+
+    pub fn on_ack(&mut self, bytes_acked: usize) {
         if self.cwnd < self.ssthresh {
-            // Slow start: one MSS per ACK, doubling the window every RTT
-            self.cwnd += self.mss;
+            // Slow start with appropriate byte counting (RFC 3465): ACKs are
+            // batched here, so growing by the acked bytes rather than one MSS
+            // per ACK keeps doubling every RTT
+            self.cwnd += bytes_acked.min(2 * self.mss);
         } else {
             // Congestion avoidance: about one MSS per RTT
             self.cwnd += (self.mss * self.mss / self.cwnd).max(1);

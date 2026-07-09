@@ -127,10 +127,10 @@ impl UdpSocket {
 
         let checksum = match (src.ip(), dst.ip()) {
             (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
-                pnet_packet::util::ipv4_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
+                crate::checksum::ipv4_checksum(&data, 3, &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
             }
             (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
-                pnet_packet::util::ipv6_checksum(&data, 3, &[], &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
+                crate::checksum::ipv6_checksum(&data, 3, &src_ip, &dst_ip, IpNextHeaderProtocols::Udp)
             }
             (_, _) => {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "address error"));
@@ -140,7 +140,7 @@ impl UdpSocket {
         data[6..8].copy_from_slice(&checksum.to_be_bytes());
         let network_tuple = NetworkTuple::new(src, dst, IpNextHeaderProtocols::Udp);
 
-        let packet = TransportPacket::new(data, network_tuple);
+        let packet = TransportPacket::new(data.freeze(), network_tuple);
         self.ip_stack.send_packet(packet).await?;
         Ok(buf.len())
     }

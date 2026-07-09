@@ -24,11 +24,19 @@ pub async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let server_addr = args.server_addr;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let dev = DeviceBuilder::new()
+    let dev = match DeviceBuilder::new()
         .mtu(MTU)
         .ipv6("CDCD:910A:2222:5498:8475:1111:3900:2025", 64)
         .ipv4("10.1.0.29", 24, None)
-        .build_async()?;
+        .build_async()
+    {
+        Ok(dev) => dev,
+        Err(e) => {
+            // Environments without IPv6 (e.g. containers) reject the IPv6 address
+            log::warn!("failed to create dual-stack TUN ({e}), falling back to IPv4 only");
+            DeviceBuilder::new().mtu(MTU).ipv4("10.1.0.29", 24, None).build_async()?
+        }
+    };
     let dev = Arc::new(dev);
     let ip_stack_config = IpStackConfig::builder().ipv4_mtu(MTU).ipv6_mtu(MTU).build();
     let (ip_stack_send, ip_stack_recv) = ip_stack(ip_stack_config)?;
