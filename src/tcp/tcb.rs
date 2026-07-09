@@ -529,6 +529,13 @@ impl Tcb {
                     continue;
                 }
                 let n = payload.len() >> 3;
+                for index in 0..n {
+                    let offset = index * 8;
+                    let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                    if self.highest_sack_end.is_none_or(|v| right > v) {
+                        self.highest_sack_end = Some(right);
+                    }
+                }
                 for inflight_packet in self.inflight_packets.iter_mut() {
                     if inflight_packet.confirmed {
                         continue;
@@ -634,6 +641,7 @@ impl Tcb {
                             if self.duplicate_ack_count > 3 {
                                 self.duplicate_ack_count = 0;
                                 if self.back_n() {
+                                    self.rto_recovery = false;
                                     self.congestion_window.on_fast_retransmit();
                                 }
                             }
@@ -831,6 +839,9 @@ impl Tcb {
         let mut distance = (ack - self.rcv_ack).0 as usize;
         self.congestion_window.on_ack(distance);
         self.rcv_ack = ack;
+        if self.highest_sack_end.is_some_and(|v| self.rcv_ack >= v) {
+            self.highest_sack_end = None;
+        }
         let now = Instant::now();
         let mut rtt_candidate_seen = false;
         while let Some(inflight_packet) = self.inflight_packets.front_mut() {
@@ -937,9 +948,16 @@ impl Tcb {
 
     pub fn retransmission(&mut self) -> Option<TransportPacket> {
         let back_seq = self.back_seq?;
+        // Fast-retransmit recovery only covers the hole below the highest
+        // SACKed sequence: segments at or above it were never reported lost
+        // and are left to the cumulative ACK (or a later RTO).
+        let sack_limit = if self.rto_recovery { None } else { self.highest_sack_end };
         for packet in self.inflight_packets.iter_mut() {
             if packet.confirmed {
                 continue;
+            }
+            if sack_limit.is_some_and(|limit| packet.start() >= limit) {
+                break;
             }
             if packet.end() > back_seq {
                 let next_back_seq = packet.end();
@@ -998,6 +1016,9 @@ impl Tcb {
             return;
         }
         if self.back_n() {
+            // After an RTO everything unacknowledged is presumed lost:
+            // retransmit the whole window regardless of SACK hints
+            self.rto_recovery = true;
             self.congestion_window.on_rto();
             self.backoff_rto();
         } else {
