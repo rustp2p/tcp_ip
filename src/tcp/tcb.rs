@@ -31,6 +31,11 @@ pub(crate) const fn default_mss(mtu: u16, is_ipv4: bool) -> u16 {
 }
 const MAX_DIFF: u32 = u32::MAX / 2;
 const MSS_MIN: u16 = 536;
+/// Default receive window scale (RFC 7323).
+const DEFAULT_WINDOW_SHIFT_CNT: u8 = 2;
+/// A SACK option holds at most 4 blocks without other options competing
+/// for the 40-byte option space (RFC 2018).
+const MAX_SACK_BLOCKS: usize = 4;
 
 /// Enum representing the various states of a TCP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::IntoPrimitive, num_enum::TryFromPrimitive)]
@@ -77,7 +82,19 @@ pub struct Tcb {
     snd_wnd: u16,
     rcv_wnd: u16,
     mss: u16,
+    /// SACK enabled in the local config.
+    sack_enabled: bool,
+    /// SACK negotiated: enabled locally and the peer sent SACK-permitted.
     sack_permitted: bool,
+    /// Highest right edge among the peer's SACK blocks; segments at or above
+    /// it are not marked lost, so fast retransmit stops there.
+    highest_sack_end: Option<SeqNum>,
+    /// The current recovery was triggered by an RTO: retransmit the whole
+    /// window (go-back-n) instead of stopping at `highest_sack_end`.
+    rto_recovery: bool,
+    ack_delay: Option<Duration>,
+    /// When the currently deferred ACK must be sent at the latest.
+    ack_deadline: Option<Instant>,
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
     duplicate_ack_count: usize,
@@ -258,6 +275,15 @@ pub struct TcpConfig {
     pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
     pub quick_end: bool,
+    /// Enable SACK (RFC 2018): negotiate SACK-permitted, advertise received
+    /// out-of-order ranges in ACKs, and use the peer's SACK blocks to narrow
+    /// retransmissions.
+    pub sack: bool,
+    /// `None` sends an ACK as soon as one is due (the default). `Some(d)`
+    /// enables delayed ACKs: a pure ACK may be held back for up to `d`,
+    /// unless at least two full segments are unacknowledged, data arrived
+    /// out of order, or the connection is not established (RFC 1122).
+    pub ack_delay: Option<Duration>,
 }
 
 impl Default for TcpConfig {
@@ -267,10 +293,11 @@ impl Default for TcpConfig {
             time_wait_timeout: Duration::from_secs(60),
             mss: None,
             rcv_wnd: u16::MAX,
-            // Window size too large can cause packet loss
-            window_shift_cnt: 2,
+            window_shift_cnt: DEFAULT_WINDOW_SHIFT_CNT,
             // If the stream is closed, exit the corresponding task immediately
             quick_end: true,
+            sack: true,
+            ack_delay: None,
         }
     }
 }
@@ -285,6 +312,15 @@ impl TcpConfig {
 
         if self.retransmission_timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "retransmission_timeout is zero"));
+        }
+        if self.window_shift_cnt > 14 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "window_shift_cnt cannot exceed 14"));
+        }
+        if let Some(delay) = self.ack_delay {
+            if delay.is_zero() || delay > Duration::from_millis(500) {
+                // RFC 1122: an ACK must not be delayed for more than 0.5 seconds
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "ack_delay must be in (0, 500ms]"));
+            }
         }
         Ok(())
     }
@@ -305,7 +341,12 @@ impl Tcb {
             rcv_wnd: config.rcv_wnd,
             rcv_ack: snd_seq,
             mss: config.mss.unwrap_or(MSS_MIN),
+            sack_enabled: config.sack,
             sack_permitted: false,
+            highest_sack_end: None,
+            rto_recovery: false,
+            ack_delay: config.ack_delay,
+            ack_deadline: None,
             snd_window_shift_cnt: 0,
             rcv_window_shift_cnt: config.window_shift_cnt,
             duplicate_ack_count: 0,
@@ -443,10 +484,12 @@ impl Tcb {
         options.put_u8(TcpOptionNumbers::WSCALE.0);
         options.put_u8(3);
         options.put_u8(self.rcv_window_shift_cnt);
-        options.put_u8(TcpOptionNumbers::NOP.0);
-        options.put_u8(TcpOptionNumbers::NOP.0);
-        options.put_u8(TcpOptionNumbers::SACK_PERMITTED.0);
-        options.put_u8(2);
+        if self.sack_enabled {
+            options.put_u8(TcpOptionNumbers::NOP.0);
+            options.put_u8(TcpOptionNumbers::NOP.0);
+            options.put_u8(TcpOptionNumbers::SACK_PERMITTED.0);
+            options.put_u8(2);
+        }
         options
     }
     fn option(&mut self, tcp_packet: &TcpPacket<'_>) {
@@ -467,8 +510,9 @@ impl Tcb {
                     }
                 }
                 TcpOptionNumbers::SACK_PERMITTED => {
-                    // Selective acknowledgements permitted.
-                    self.sack_permitted = true;
+                    // Selective acknowledgements permitted (only when also
+                    // enabled locally).
+                    self.sack_permitted = self.sack_enabled;
                 }
                 TcpOptionNumber(_) => {}
             }
@@ -1047,8 +1091,53 @@ impl Tcb {
         self.create_transport_packet_seq(FIN | ACK, seq, &[])
     }
     pub fn ack_packet(&self) -> TransportPacket {
-        let seq = self.snd_seq.0;
-        self.create_transport_packet_seq(ACK, seq, &[])
+        if let Some(options) = self.sack_option_blocks() {
+            self.create_option_transport_packet(ACK, &[], Some(&options))
+        } else {
+            let seq = self.snd_seq.0;
+            self.create_transport_packet_seq(ACK, seq, &[])
+        }
+    }
+    /// Encodes the buffered out-of-order ranges as a SACK option (RFC 2018)
+    /// so the peer can retransmit only the missing segments.
+    fn sack_option_blocks(&self) -> Option<BytesMut> {
+        if !self.sack_permitted || self.tcp_out_of_order_queue.is_empty() {
+            return None;
+        }
+        let mut blocks: [(u32, u32); MAX_SACK_BLOCKS] = Default::default();
+        let mut count = 0;
+        // The queue is ordered by sequence number, so overlapping or adjacent
+        // segments can be merged in one pass. RFC 2018 asks for the most
+        // recently received block first; recency is not tracked, and senders
+        // handle sequence-ordered blocks just as well.
+        for packet in &self.tcp_out_of_order_queue {
+            let start = packet.start();
+            let end = packet.end();
+            if count > 0 {
+                let last = &mut blocks[count - 1];
+                if start <= SeqNum(last.1) {
+                    if end > SeqNum(last.1) {
+                        last.1 = end.0;
+                    }
+                    continue;
+                }
+            }
+            if count == MAX_SACK_BLOCKS {
+                break;
+            }
+            blocks[count] = (start.0, end.0);
+            count += 1;
+        }
+        let mut options = BytesMut::with_capacity(4 + count * 8);
+        options.put_u8(TcpOptionNumbers::NOP.0);
+        options.put_u8(TcpOptionNumbers::NOP.0);
+        options.put_u8(TcpOptionNumbers::SACK.0);
+        options.put_u8(2 + 8 * count as u8);
+        for (left, right) in &blocks[..count] {
+            options.put_u32(*left);
+            options.put_u32(*right);
+        }
+        Some(options)
     }
 }
 
@@ -1171,5 +1260,97 @@ impl CongestionWindow {
 
     pub fn current_window_size(&self) -> usize {
         self.cwnd
+    }
+}
+
+#[cfg(test)]
+mod sack_tests {
+    use super::*;
+
+    fn test_tcb() -> Tcb {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let mut tcb = Tcb::new_listen(local, peer, TcpConfig::default());
+        tcb.sack_permitted = true;
+        tcb
+    }
+
+    fn ofo_push(tcb: &mut Tcb, seq: u32, len: usize) {
+        tcb.tcp_out_of_order_queue
+            .push(UnreadPacket::new(SeqNum(seq), ACK, Bytes::from(vec![0u8; len])));
+    }
+
+    fn parse_blocks(options: &BytesMut) -> Vec<(u32, u32)> {
+        assert_eq!(options.len() % 4, 0, "options must stay 4-byte aligned");
+        assert_eq!(options[0], TcpOptionNumbers::NOP.0);
+        assert_eq!(options[1], TcpOptionNumbers::NOP.0);
+        assert_eq!(options[2], TcpOptionNumbers::SACK.0);
+        let len = options[3] as usize;
+        assert_eq!(len, options.len() - 2);
+        assert_eq!((len - 2) % 8, 0);
+        (0..(len - 2) / 8)
+            .map(|i| {
+                let offset = 4 + i * 8;
+                (
+                    u32::from_be_bytes(options[offset..offset + 4].try_into().unwrap()),
+                    u32::from_be_bytes(options[offset + 4..offset + 8].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_blocks_without_out_of_order_data() {
+        let tcb = test_tcb();
+        assert!(tcb.sack_option_blocks().is_none());
+    }
+
+    #[test]
+    fn no_blocks_when_sack_not_negotiated() {
+        let mut tcb = test_tcb();
+        tcb.sack_permitted = false;
+        ofo_push(&mut tcb, 100, 50);
+        assert!(tcb.sack_option_blocks().is_none());
+    }
+
+    #[test]
+    fn merges_overlapping_and_adjacent_ranges() {
+        let mut tcb = test_tcb();
+        ofo_push(&mut tcb, 100, 50); // 100..150
+        ofo_push(&mut tcb, 150, 50); // adjacent -> 100..200
+        ofo_push(&mut tcb, 180, 40); // overlapping -> 100..220
+        ofo_push(&mut tcb, 300, 10); // separate
+        let options = tcb.sack_option_blocks().unwrap();
+        assert_eq!(parse_blocks(&options), vec![(100, 220), (300, 310)]);
+    }
+
+    #[test]
+    fn caps_at_four_blocks() {
+        let mut tcb = test_tcb();
+        for i in 0..6u32 {
+            ofo_push(&mut tcb, 1000 * (i + 1), 100);
+        }
+        let options = tcb.sack_option_blocks().unwrap();
+        let blocks = parse_blocks(&options);
+        assert_eq!(blocks.len(), MAX_SACK_BLOCKS);
+        assert_eq!(blocks[0], (1000, 1100));
+        assert_eq!(blocks[3], (4000, 4100));
+    }
+
+    #[test]
+    fn ack_packet_roundtrips_through_pnet() {
+        let mut tcb = test_tcb();
+        ofo_push(&mut tcb, 500, 100);
+        let packet = tcb.ack_packet();
+        let tcp_packet = TcpPacket::new(&packet.buf).unwrap();
+        assert_eq!(tcp_packet.get_data_offset() as usize * 4, TCP_HEADER_LEN + 12);
+        let sack = tcp_packet
+            .get_options_iter()
+            .find(|op| op.get_number() == TcpOptionNumbers::SACK)
+            .expect("ack must carry a sack option");
+        let payload = sack.payload();
+        assert_eq!(payload.len(), 8);
+        assert_eq!(u32::from_be_bytes(payload[0..4].try_into().unwrap()), 500);
+        assert_eq!(u32::from_be_bytes(payload[4..8].try_into().unwrap()), 600);
     }
 }
