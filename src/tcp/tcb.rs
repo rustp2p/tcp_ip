@@ -31,8 +31,10 @@ pub(crate) const fn default_mss(mtu: u16, is_ipv4: bool) -> u16 {
 }
 const MAX_DIFF: u32 = u32::MAX / 2;
 const MSS_MIN: u16 = 536;
-/// Default receive window scale (RFC 7323).
-const DEFAULT_WINDOW_SHIFT_CNT: u8 = 2;
+/// Default receive window scale (RFC 7323): u16::MAX << 4 ≈ 1 MiB effective
+/// window. Larger scales keep improving one-way throughput but grow the
+/// per-connection buffer bound proportionally.
+const DEFAULT_WINDOW_SHIFT_CNT: u8 = 4;
 /// A SACK option holds at most 4 blocks without other options competing
 /// for the 40-byte option space (RFC 2018).
 const MAX_SACK_BLOCKS: usize = 4;
