@@ -166,17 +166,11 @@ async fn large_transfer() {
     .unwrap();
 }
 
-#[tokio::test]
-async fn large_transfer_lossy_and_reordered() {
+async fn run_large_transfer_lossy(tcp_config: TcpConfig, port: u16) {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let tcp_config = TcpConfig {
-            retransmission_timeout: Duration::from_millis(50),
-            time_wait_timeout: Duration::from_secs(1),
-            ..Default::default()
-        };
         let config = IpStackConfig::builder().tcp_config(tcp_config).build();
         let (stack_a, stack_b) = connect_stacks(config, true);
-        let server_addr: SocketAddr = format!("{IP_B}:8082").parse().unwrap();
+        let server_addr: SocketAddr = format!("{IP_B}:{port}").parse().unwrap();
         let mut listener = TcpListener::bind(stack_b, server_addr).await.unwrap();
 
         let data = test_data(512 * 1024);
@@ -201,6 +195,40 @@ async fn large_transfer_lossy_and_reordered() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn large_transfer_lossy_and_reordered() {
+    let tcp_config = TcpConfig {
+        retransmission_timeout: Duration::from_millis(50),
+        time_wait_timeout: Duration::from_secs(1),
+        ..Default::default()
+    };
+    run_large_transfer_lossy(tcp_config, 8082).await;
+}
+
+/// The lossy transfer must also succeed with SACK disabled (pure go-back-n).
+#[tokio::test]
+async fn large_transfer_lossy_sack_disabled() {
+    let tcp_config = TcpConfig {
+        retransmission_timeout: Duration::from_millis(50),
+        time_wait_timeout: Duration::from_secs(1),
+        sack: false,
+        ..Default::default()
+    };
+    run_large_transfer_lossy(tcp_config, 8182).await;
+}
+
+/// Delayed ACKs must not stall or corrupt a lossy transfer.
+#[tokio::test]
+async fn large_transfer_lossy_delayed_ack() {
+    let tcp_config = TcpConfig {
+        retransmission_timeout: Duration::from_millis(50),
+        time_wait_timeout: Duration::from_secs(1),
+        ack_delay: Some(Duration::from_millis(40)),
+        ..Default::default()
+    };
+    run_large_transfer_lossy(tcp_config, 8282).await;
 }
 
 /// The receiver stops reading long enough for its window to close, then
