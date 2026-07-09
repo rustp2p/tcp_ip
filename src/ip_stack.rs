@@ -332,8 +332,9 @@ pub(crate) struct IpStackInner {
     pub(crate) udp_socket_map: DashMap<(Option<SocketAddr>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) raw_socket_map: DashMap<(Option<IpNextHeaderProtocol>, Option<SocketAddr>), flume::Sender<TransportPacket>>,
     pub(crate) packet_sender: Sender<TransportPacket>,
-    bind_addrs: Mutex<HashSet<(IpNextHeaderProtocol, SocketAddr)>>,
+    bind_addrs: Mutex<HashSet<BindKey>>,
 }
+type BindKey = (IpNextHeaderProtocol, SocketAddr, Option<SocketAddr>);
 impl IpStackInner {
     fn remove_all(&self) {
         self.active_state.store(false, Ordering::SeqCst);
@@ -678,20 +679,22 @@ impl IpStack {
             Err(_) => Err(io::Error::new(io::ErrorKind::WriteZero, "ip stack close")),
         }
     }
-    pub(crate) fn bind(&self, protocol: IpNextHeaderProtocol, addr: &mut SocketAddr) -> io::Result<BindAddr> {
-        let bind_address = self.inner.add_bind_addr(protocol, *addr, true)?;
+    pub(crate) fn bind(&self, protocol: IpNextHeaderProtocol, addr: &mut SocketAddr, peer: Option<SocketAddr>) -> io::Result<BindAddr> {
+        let bind_address = self.inner.add_bind_addr(protocol, *addr, peer, true)?;
         *addr = bind_address;
         Ok(BindAddr {
             protocol,
             addr: bind_address,
+            peer,
             inner: self.inner.clone(),
         })
     }
     pub(crate) fn bind_ip(&self, protocol: IpNextHeaderProtocol, addr: SocketAddr) -> io::Result<BindAddr> {
-        _ = self.inner.add_bind_addr(protocol, addr, false)?;
+        _ = self.inner.add_bind_addr(protocol, addr, None, false)?;
         Ok(BindAddr {
             protocol,
             addr,
+            peer: None,
             inner: self.inner.clone(),
         })
     }
@@ -1755,7 +1758,13 @@ impl Routes {
 }
 
 impl IpStackInner {
-    fn add_bind_addr(&self, protocol: IpNextHeaderProtocol, mut addr: SocketAddr, set_port: bool) -> io::Result<SocketAddr> {
+    fn add_bind_addr(
+        &self,
+        protocol: IpNextHeaderProtocol,
+        mut addr: SocketAddr,
+        peer: Option<SocketAddr>,
+        set_port: bool,
+    ) -> io::Result<SocketAddr> {
         let mut guard = self.bind_addrs.lock();
         if set_port && addr.port() == 0 {
             let port_start: u16 = rand::rng().random_range(1..=65535);
@@ -1765,33 +1774,44 @@ impl IpStackInner {
                     continue;
                 }
                 addr.set_port(port);
-                if !guard.contains(&(protocol, addr)) {
-                    guard.insert((protocol, addr));
+                let key = (protocol, addr, peer);
+                if !guard.contains(&key) {
+                    guard.insert(key);
                     return Ok(addr);
                 }
             }
             return Err(io::Error::new(io::ErrorKind::AddrInUse, "Address already in use"));
         }
-        if guard.contains(&(protocol, addr)) {
+        let key = (protocol, addr, peer);
+        if guard.contains(&key) {
             return Err(io::Error::new(io::ErrorKind::AddrInUse, "Address already in use"));
         }
-        guard.insert((protocol, addr));
+        guard.insert(key);
         Ok(addr)
     }
-    fn remove_bind_addr(&self, protocol: IpNextHeaderProtocol, addr: SocketAddr) {
+    fn remove_bind_addr(&self, protocol: IpNextHeaderProtocol, addr: SocketAddr, peer: Option<SocketAddr>) {
         let mut guard = self.bind_addrs.lock();
-        guard.remove(&(protocol, addr));
+        guard.remove(&(protocol, addr, peer));
     }
 }
 #[derive(Debug)]
 pub(crate) struct BindAddr {
     protocol: IpNextHeaderProtocol,
     pub(crate) addr: SocketAddr,
+    peer: Option<SocketAddr>,
     inner: Arc<IpStackInner>,
+}
+impl BindAddr {
+    pub(crate) fn set_peer(&mut self, local: SocketAddr, peer: SocketAddr) -> io::Result<()> {
+        self.inner.remove_bind_addr(self.protocol, local, self.peer);
+        self.inner.add_bind_addr(self.protocol, local, Some(peer), false)?;
+        self.peer = Some(peer);
+        Ok(())
+    }
 }
 impl Drop for BindAddr {
     fn drop(&mut self) {
-        self.inner.remove_bind_addr(self.protocol, self.addr);
+        self.inner.remove_bind_addr(self.protocol, self.addr, self.peer);
     }
 }
 

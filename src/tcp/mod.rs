@@ -153,7 +153,7 @@ impl TcpListener {
     async fn bind0(ip_stack: IpStack, mut local_addr: Option<SocketAddr>) -> io::Result<Self> {
         let (packet_sender, packet_receiver) = channel(ip_stack.config.tcp_syn_channel_size());
         let _bind_addr = if let Some(addr) = &mut local_addr {
-            Some(ip_stack.bind(IpNextHeaderProtocols::Tcp, addr)?)
+            Some(ip_stack.bind(IpNextHeaderProtocols::Tcp, addr, None)?)
         } else {
             None
         };
@@ -262,7 +262,7 @@ impl TcpStream {
         let ip_stack = IpStack::get()?;
         let mut local_addr = local_addr.to_addr()?;
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
-        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr)?;
+        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr, None)?;
         Ok(Self::new_uncheck(Some(bind_addr), Some(ip_stack), local_addr, None, None, None))
     }
     pub async fn connect<A: ToSocketAddr>(dest: A) -> io::Result<Self> {
@@ -275,7 +275,7 @@ impl TcpStream {
     pub fn bind<A: ToSocketAddr>(ip_stack: IpStack, local_addr: A) -> io::Result<Self> {
         let mut local_addr = local_addr.to_addr()?;
         ip_stack.routes().check_bind_ip(local_addr.ip())?;
-        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr)?;
+        let bind_addr = ip_stack.bind(IpNextHeaderProtocols::Tcp, &mut local_addr, None)?;
         Ok(Self::new_uncheck(Some(bind_addr), Some(ip_stack), local_addr, None, None, None))
     }
     pub async fn connect<A: ToSocketAddr>(ip_stack: IpStack, dest: A) -> io::Result<Self> {
