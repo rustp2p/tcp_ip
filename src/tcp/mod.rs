@@ -369,7 +369,7 @@ impl TcpStream {
         let mss = stream_task.mss() as usize;
         tokio::spawn(async move {
             if let Err(e) = stream_task.run().await {
-                log::warn!("stream_task run {local_addr}->{peer_addr}: {e:?}")
+                log::trace!("stream_task run {local_addr}->{peer_addr}: {e:?}")
             }
         });
         let read = TcpStreamReadHalf {
@@ -430,7 +430,7 @@ impl TcpStream {
         let (stream, mut stream_task) = Self::new0(ip_stack, tcb)?;
         tokio::spawn(async move {
             if let Err(e) = stream_task.run().await {
-                log::warn!("stream_task run {local_addr}->{peer_addr}: {e:?}")
+                log::trace!("stream_task run {local_addr}->{peer_addr}: {e:?}")
             }
         });
         Ok(stream)
