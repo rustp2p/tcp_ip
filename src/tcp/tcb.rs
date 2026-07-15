@@ -99,6 +99,7 @@ pub struct Tcb {
     ack_deadline: Option<Instant>,
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
+    window_scale_negotiated: bool,
     duplicate_ack_count: usize,
     tcp_receive_queue: TcpReceiveQueue,
     tcp_out_of_order_queue: TcpOfoQueue,
@@ -351,6 +352,7 @@ impl Tcb {
             ack_deadline: None,
             snd_window_shift_cnt: 0,
             rcv_window_shift_cnt: config.window_shift_cnt,
+            window_scale_negotiated: false,
             duplicate_ack_count: 0,
             // rcv_seq: SeqNum(0),
             tcp_receive_queue: Default::default(),
@@ -373,7 +375,7 @@ impl Tcb {
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
         if self.state == TcpState::Listen || self.state == TcpState::SynSent {
             self.sent_syn();
-            let options = self.get_options();
+            let options = self.get_options(true);
             let packet = self.create_option_transport_packet(SYN, &[], Some(&options));
             Some(packet)
         } else {
@@ -393,7 +395,7 @@ impl Tcb {
             // self.rcv_seq = self.snd_ack;
             self.snd_wnd = tcp_packet.get_window();
             self.recv_syn();
-            let options = self.get_options();
+            let options = self.get_options(self.window_scale_negotiated);
             let relay = self.create_option_transport_packet(SYN | ACK, &[], Some(&options));
             Some(relay)
         } else {
@@ -423,7 +425,7 @@ impl Tcb {
             self.snd_seq = SeqNum(packet.get_acknowledgement());
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.recv_syn_ack();
-            self.init_congestion_window();
+            self.init_congestion_window(true);
             // The SYN-ACK already advertised the current receive window.
             // Starting the stream task with the constructor's zero snapshot
             // would make the next unrelated inbound packet trigger a spurious
@@ -460,16 +462,18 @@ impl Tcb {
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.snd_wnd = packet.get_window();
             self.recv_syn_ack();
-            self.init_congestion_window();
+            // The window field in a SYN-ACK is never scaled.
+            self.init_congestion_window(false);
             let relay = self.create_option_transport_packet(ACK, &[], None);
             return Some(relay);
         }
         None
     }
-    fn init_congestion_window(&mut self) {
+    fn init_congestion_window(&mut self, scale_peer_window: bool) {
         // RFC 6928 initial window
         let initial_cwnd = self.mss as usize * 10;
-        let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
+        let shift = if scale_peer_window { self.snd_window_shift_cnt } else { 0 };
+        let max_cwnd = (self.snd_wnd as usize) << shift;
         self.congestion_window.init(initial_cwnd, max_cwnd, self.mss as usize);
     }
 }
@@ -484,17 +488,19 @@ impl Tcb {
     pub fn mss(&self) -> u16 {
         self.mss
     }
-    fn get_options(&self) -> BytesMut {
+    fn get_options(&self, include_window_scale: bool) -> BytesMut {
         let mut options = BytesMut::with_capacity(40);
         let mss = self.mss;
         options.put_u8(TcpOptionNumbers::MSS.0);
         options.put_u8(4);
         options.put_u16(mss);
 
-        options.put_u8(TcpOptionNumbers::NOP.0);
-        options.put_u8(TcpOptionNumbers::WSCALE.0);
-        options.put_u8(3);
-        options.put_u8(self.rcv_window_shift_cnt);
+        if include_window_scale {
+            options.put_u8(TcpOptionNumbers::NOP.0);
+            options.put_u8(TcpOptionNumbers::WSCALE.0);
+            options.put_u8(3);
+            options.put_u8(self.rcv_window_shift_cnt);
+        }
         if self.sack_enabled {
             options.put_u8(TcpOptionNumbers::NOP.0);
             options.put_u8(TcpOptionNumbers::NOP.0);
@@ -510,6 +516,7 @@ impl Tcb {
                 TcpOptionNumbers::WSCALE => {
                     if let Some(window_shift_cnt) = payload.first() {
                         self.snd_window_shift_cnt = (*window_shift_cnt).min(14);
+                        self.window_scale_negotiated = true;
                     }
                 }
                 TcpOptionNumbers::MSS => {
@@ -596,16 +603,12 @@ impl Tcb {
     }
 
     fn create_packet(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], options: Option<&[u8]>) -> BytesMut {
-        create_packet_raw(
-            &self.local_addr,
-            &self.peer_addr,
-            seq,
-            ack,
-            self.recv_window(),
-            flags,
-            payload,
-            options,
-        )
+        let recv_window = if flags & SYN == SYN {
+            self.receive_buffer_available().min(u16::MAX as usize) as u16
+        } else {
+            self.recv_window()
+        };
+        create_packet_raw(&self.local_addr, &self.peer_addr, seq, ack, recv_window, flags, payload, options)
     }
 }
 
@@ -755,7 +758,7 @@ impl Tcb {
     }
 
     fn receive_window_bytes(&self) -> u32 {
-        (self.recv_window() as u32) << self.rcv_window_shift_cnt
+        (self.recv_window() as u32) << self.effective_rcv_window_shift()
     }
 
     fn segment_acceptable(&self, seq: SeqNum, segment_len: usize) -> bool {
@@ -865,10 +868,20 @@ impl Tcb {
         self.ack_deadline
     }
     pub fn recv_window(&self) -> u16 {
-        let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
+        let shift = self.effective_rcv_window_shift();
+        (self.receive_buffer_available() >> shift).min(u16::MAX as usize) as u16
+    }
+    fn effective_rcv_window_shift(&self) -> u8 {
+        if self.window_scale_negotiated {
+            self.rcv_window_shift_cnt
+        } else {
+            0
+        }
+    }
+    fn receive_buffer_available(&self) -> usize {
+        let capacity = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
-        let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
-        (rcv_wnd >> self.rcv_window_shift_cnt) as u16
+        capacity.saturating_sub(unread_total_bytes)
     }
     fn recv_buffer_full(&self) -> bool {
         // To reduce packet loss, the actual receivable window size is larger than the recv_window()
