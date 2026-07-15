@@ -625,10 +625,12 @@ impl Tcb {
         };
         let flags = packet.get_flags();
         if flags & RST == RST {
-            // RFC 5961: only accept a RST whose sequence number falls inside the
-            // receive window, otherwise a stale packet could tear the connection down
             if self.rst_acceptable(&packet) {
                 self.recv_rst();
+            } else if self.rst_in_window(&packet) {
+                // RFC 5961: an in-window RST that does not exactly match
+                // RCV.NXT is answered with a challenge ACK.
+                return Some(self.create_transport_packet(ACK, &[]));
             }
             return None;
         }
@@ -737,13 +739,13 @@ impl Tcb {
         Some(reply_packet)
     }
     pub(crate) fn rst_acceptable(&self, packet: &TcpPacket<'_>) -> bool {
+        SeqNum(packet.get_sequence()) == self.snd_ack
+    }
+
+    fn rst_in_window(&self, packet: &TcpPacket<'_>) -> bool {
         let seq = SeqNum(packet.get_sequence());
-        let wnd = (self.recv_window() as u32) << self.rcv_window_shift_cnt;
-        if wnd == 0 {
-            seq == self.snd_ack
-        } else {
-            seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
-        }
+        let wnd = self.receive_window_bytes();
+        wnd > 0 && seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
     }
     pub fn readable(&self) -> bool {
         self.tcp_receive_queue.total_bytes() != 0

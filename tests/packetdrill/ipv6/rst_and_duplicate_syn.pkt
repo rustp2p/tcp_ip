@@ -15,6 +15,10 @@
 +0.000 < . 1:1(0) ack 1 win 65535
 +0.010 `$TCP_IP_PD_CASE ctl write-zero 0`
 
+// An in-window RST that is not exactly RCV.NXT elicits a challenge ACK.
++0.010 < R 100:100(0) win 0
++0.000 > . 1:1(0) ack 1
+
 // An out-of-window RST must not tear down the synchronized connection.
 +0.010 < R 10000000:10000000(0) win 0
 +0.010 < S 0:0(0) win 65535
