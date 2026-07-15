@@ -921,7 +921,28 @@ impl Tcb {
     }
     pub fn recv_window(&self) -> u16 {
         let shift = self.effective_rcv_window_shift();
-        (self.receive_buffer_available() >> shift).min(u16::MAX as usize) as u16
+        let available = self.receive_buffer_available();
+        let max_advertised = (u16::MAX as usize) << shift;
+        let desired = available.min(max_advertised);
+
+        // Receiver SWS avoidance (RFC 1122 section 4.2.3.3): preserve the
+        // previously advertised right edge until the application has freed
+        // at least min(half the receive buffer, one MSS). Window shrinkage
+        // caused by newly received bytes is still advertised immediately.
+        let previous_right_edge = self.last_snd_ack.add_num((self.last_snd_wnd as u32) << shift);
+        let held = if previous_right_edge > self.snd_ack {
+            (previous_right_edge - self.snd_ack).0 as usize
+        } else {
+            0
+        }
+        .min(max_advertised);
+        let threshold = (self.receive_buffer_capacity() / 2).min(self.mss as usize);
+        let advertised = if desired > held && desired - held < threshold {
+            held
+        } else {
+            desired
+        };
+        (advertised >> shift).min(u16::MAX as usize) as u16
     }
     fn effective_rcv_window_shift(&self) -> u8 {
         if self.window_scale_negotiated {
@@ -931,9 +952,12 @@ impl Tcb {
         }
     }
     fn receive_buffer_available(&self) -> usize {
-        let capacity = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
+        let capacity = self.receive_buffer_capacity();
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         capacity.saturating_sub(unread_total_bytes)
+    }
+    fn receive_buffer_capacity(&self) -> usize {
+        (self.rcv_wnd as usize) << self.rcv_window_shift_cnt
     }
     fn recv_buffer_full(&self) -> bool {
         // To reduce packet loss, the actual receivable window size is larger than the recv_window()
@@ -1631,6 +1655,55 @@ mod congestion_window_tests {
 
         assert_eq!(window.cwnd, 1_000);
         assert_eq!(window.ssthresh, 4_000);
+    }
+}
+
+#[cfg(test)]
+mod receive_window_tests {
+    use super::*;
+
+    fn test_tcb() -> Tcb {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let config = TcpConfig {
+            mss: Some(1000),
+            rcv_wnd: 4000,
+            window_shift_cnt: 0,
+            ..Default::default()
+        };
+        let mut tcb = Tcb::new_listen(local, peer, config);
+        tcb.state = TcpState::Established;
+        tcb
+    }
+
+    #[test]
+    fn small_application_reads_do_not_open_tiny_windows() {
+        let mut tcb = test_tcb();
+        for _ in 0..16 {
+            tcb.tcp_receive_queue.push(Bytes::from(vec![0; 250]));
+        }
+        tcb.perform_post_ack_action();
+        assert_eq!(tcb.recv_window(), 0);
+
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 0);
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 0);
+
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 1000);
+    }
+
+    #[test]
+    fn incoming_data_preserves_the_advertised_right_edge() {
+        let mut tcb = test_tcb();
+        tcb.perform_post_ack_action();
+        assert_eq!(tcb.recv_window(), 4000);
+
+        tcb.snd_ack = tcb.snd_ack.add_num(250);
+        tcb.tcp_receive_queue.push(Bytes::from(vec![0; 250]));
+        assert_eq!(tcb.recv_window(), 3750);
     }
 }
 

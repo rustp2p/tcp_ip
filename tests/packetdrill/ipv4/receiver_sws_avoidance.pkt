@@ -1,0 +1,26 @@
+--ip_version=ipv4
+--local_ip=192.168.42.2
+--gateway_ip=192.168.42.1
+--netmask_ip=255.255.255.0
+--remote_ip=192.0.2.1
+
+`$TCP_IP_PD_CASE setup ipv4`
+
+0.000 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 listen(3, 1) = 0
++0.000 `$TCP_IP_PD_CASE ctl listen 192.168.42.2:8080`
++0.010 < S 0:0(0) win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > S. 0:0(0) ack 1 win 65535 <...>
++0.000 < . 1:1(0) ack 1 win 65535
+
++0.010 < P. 1:2(1) ack 1 win 65535
++0.000 > . 1:1(0) ack 2 win 65534
++0.010 `$TCP_IP_PD_CASE ctl expect-read-zero 1`
+// A one-byte read is below the SWS threshold; a duplicate segment must
+// observe the same advertised right edge instead of a one-byte reopening.
++0.010 < P. 1:2(1) ack 1 win 65535
++0.000 > . 1:1(0) ack 2 win 65534
+
+`$TCP_IP_PD_CASE cleanup`
