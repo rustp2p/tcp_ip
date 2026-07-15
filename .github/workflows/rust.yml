@@ -8,22 +8,48 @@ env:
 
 jobs:
   build_n_test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: rustfmt
         run: cargo fmt --all -- --check
-      - name: check
-        run: cargo check --verbose
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: build
-        run: cargo build --verbose --examples --tests --all-features
-      - name: test
-        run: cargo test --all-features --examples
+      - name: Default-feature tests
+        run: cargo test
+      - name: All-feature build
+        run: cargo build --all-targets --all-features
+      - name: All-feature library tests
+        run: cargo test --all-features --lib
+      - name: All-feature documentation tests
+        run: cargo test --all-features --doc
+
+  packetdrill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install packetdrill dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git gcc make bison flex python3 net-tools iptables
+      - name: Build pinned packetdrill
+        run: |
+          packetdrill_bin="$(bash scripts/setup_packetdrill.sh)"
+          echo "PACKETDRILL_BIN=${packetdrill_bin}" >> "$GITHUB_ENV"
+      - name: Build tcp_ip packetdrill harness
+        run: cargo build --example packetdrill_harness
+      - name: Run IPv4 and IPv6 packetdrill suites
+        run: sudo --preserve-env=PACKETDRILL_BIN env HOME="$HOME" TCP_IP_PD_SKIP_BUILD=1 bash scripts/run_packetdrill.sh
+      - name: Upload packetdrill failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packetdrill-logs
+          path: target/packetdrill/logs
+          if-no-files-found: ignore

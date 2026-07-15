@@ -174,6 +174,9 @@ impl SeqNum {
     fn add_num(self, n: u32) -> Self {
         SeqNum(self.0.wrapping_add(n))
     }
+    fn sub_num(self, n: u32) -> Self {
+        SeqNum(self.0.wrapping_sub(n))
+    }
     fn add_update(&mut self, n: u32) {
         self.0 = self.0.wrapping_add(n)
     }
@@ -424,6 +427,11 @@ impl Tcb {
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.recv_syn_ack();
             self.init_congestion_window();
+            // The SYN-ACK already advertised the current receive window.
+            // Starting the stream task with the constructor's zero snapshot
+            // would make the next unrelated inbound packet trigger a spurious
+            // window-update ACK.
+            self.last_snd_wnd = self.recv_window();
             if !packet.payload().is_empty() {
                 let seq = SeqNum(packet.get_sequence());
                 buf.advance(header_len);
@@ -640,7 +648,7 @@ impl Tcb {
                         // Only a pure ACK carrying no data counts as a duplicate ACK
                         if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN && wnd_unchanged {
                             self.duplicate_ack_count += 1;
-                            if self.duplicate_ack_count > 3 {
+                            if self.duplicate_ack_count >= 3 {
                                 self.duplicate_ack_count = 0;
                                 if self.back_n() {
                                     self.rto_recovery = false;
@@ -689,7 +697,7 @@ impl Tcb {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
                     self.update_last_ack(&packet);
-                    if acknowledgement == self.snd_seq.add_num(1) {
+                    if acknowledgement == self.snd_seq {
                         self.recv_fin_ack()
                     }
                 }
@@ -851,14 +859,7 @@ impl Tcb {
     }
     fn update_last_ack(&mut self, tcp_packet: &TcpPacket<'_>) {
         let ack = AckNum::from(tcp_packet.get_acknowledgement());
-        let max_ack = if matches!(
-            self.state,
-            TcpState::FinWait1 | TcpState::FinWait2 | TcpState::Closing | TcpState::LastAck
-        ) {
-            self.snd_seq.add_num(1)
-        } else {
-            self.snd_seq
-        };
+        let max_ack = self.snd_seq;
         if ack > max_ack {
             self.requires_ack_repeat = true;
             return;
@@ -898,7 +899,7 @@ impl Tcb {
         } else {
             self.reset_write_timeout();
         }
-        if !self.writeable_state() && self.rcv_ack > self.snd_seq {
+        if !self.writeable_state() && self.rcv_ack >= self.snd_seq {
             self.recv_fin_ack()
         }
         self.reset_write_timeout();
@@ -1101,8 +1102,14 @@ impl Tcb {
 
     pub fn sent_fin(&mut self) {
         match self.state {
-            TcpState::Established => self.state = TcpState::FinWait1,
-            TcpState::CloseWait => self.state = TcpState::LastAck,
+            TcpState::Established => {
+                self.snd_seq.add_update(1);
+                self.state = TcpState::FinWait1;
+            }
+            TcpState::CloseWait => {
+                self.snd_seq.add_update(1);
+                self.state = TcpState::LastAck;
+            }
             _ => {}
         }
     }
@@ -1127,7 +1134,10 @@ impl Tcb {
     fn recv_fin_ack(&mut self) {
         match self.state {
             TcpState::FinWait1 => self.state = TcpState::FinWait2,
-            TcpState::Closing => self.state = TcpState::TimeWait,
+            TcpState::Closing => {
+                self.time_wait = Some(Instant::now() + self.time_wait_timeout);
+                self.state = TcpState::TimeWait;
+            }
             TcpState::LastAck => self.state = TcpState::Closed,
             _ => {}
         }
@@ -1143,7 +1153,11 @@ impl Tcb {
         self.state = TcpState::Closed
     }
     pub fn fin_packet(&self) -> TransportPacket {
-        let seq = self.snd_seq.0;
+        let seq = if matches!(self.state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck) {
+            self.snd_seq.sub_num(1).0
+        } else {
+            self.snd_seq.0
+        };
         self.create_transport_packet_seq(FIN | ACK, seq, &[])
     }
     pub fn ack_packet(&self) -> TransportPacket {
