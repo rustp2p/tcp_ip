@@ -441,6 +441,13 @@ impl Tcb {
         }
         false
     }
+    pub fn syn_ack_packet(&self) -> Option<TransportPacket> {
+        if self.state != TcpState::SynReceived {
+            return None;
+        }
+        let options = self.get_options(self.window_scale_negotiated);
+        Some(self.create_option_transport_packet(SYN | ACK, &[], Some(&options)))
+    }
     pub fn try_syn_sent_to_established(&mut self, buf: Bytes) -> Option<TransportPacket> {
         let packet = TcpPacket::new(&buf)?;
         let flags = packet.get_flags();

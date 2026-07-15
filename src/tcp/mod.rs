@@ -69,7 +69,14 @@ pub struct TcpListener {
     ip_stack: IpStack,
     packet_receiver: Receiver<TransportPacket>,
     local_addr: Option<SocketAddr>,
-    tcb_map: HashMap<NetworkTuple, (Tcb, Instant)>,
+    tcb_map: HashMap<NetworkTuple, HalfOpenTcb>,
+}
+
+struct HalfOpenTcb {
+    tcb: Tcb,
+    created_at: Instant,
+    retransmit_at: Instant,
+    rto: Duration,
 }
 
 /// A TCP stream between a local and a remote socket.
@@ -171,7 +178,18 @@ impl TcpListener {
     }
     pub async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
-            if let Some(packet) = self.packet_receiver.recv().await {
+            let packet = if let Some(deadline) = self.tcb_map.values().map(|entry| entry.retransmit_at).min() {
+                tokio::select! {
+                    packet = self.packet_receiver.recv() => packet,
+                    _ = tokio::time::sleep_until(deadline.into()) => {
+                        self.retransmit_half_open().await?;
+                        continue;
+                    }
+                }
+            } else {
+                self.packet_receiver.recv().await
+            };
+            if let Some(packet) = packet {
                 let network_tuple = &packet.network_tuple;
                 if let Some(v) = self.ip_stack.inner.tcp_stream_map.get(network_tuple).as_deref().cloned() {
                     // If a TCP stream has already been generated, hand it over to the corresponding stream
@@ -186,8 +204,8 @@ impl TcpListener {
                 let local_addr = network_tuple.dst;
                 let peer_addr = network_tuple.src;
                 if tcp_packet.get_flags() & RST == RST {
-                    if let Some((tcb, _)) = self.tcb_map.get(network_tuple) {
-                        if tcb.rst_acceptable(&tcp_packet) {
+                    if let Some(entry) = self.tcb_map.get(network_tuple) {
+                        if entry.tcb.rst_acceptable(&tcp_packet) {
                             self.tcb_map.remove(network_tuple);
                             self.ip_stack.remove_tcp_half_open(network_tuple);
                         }
@@ -200,6 +218,14 @@ impl TcpListener {
                         log::debug!("drop tcp syn: half-open connection limit reached");
                         continue;
                     }
+                    if let Some(entry) = self.tcb_map.get_mut(network_tuple) {
+                        if let Some(relay_packet) = entry.tcb.try_syn_received(&tcp_packet) {
+                            entry.retransmit_at = Instant::now() + entry.rto;
+                            self.ip_stack.send_packet(relay_packet).await?;
+                            continue;
+                        }
+                    }
+
                     // LISTEN -> SYN_RECEIVED
                     let mut tcp_config = self.ip_stack.config.tcp_config();
                     if tcp_config.mss.is_none() {
@@ -210,20 +236,30 @@ impl TcpListener {
                     }
                     let mut tcb = Tcb::new_listen(local_addr, peer_addr, tcp_config);
                     if let Some(relay_packet) = tcb.try_syn_received(&tcp_packet) {
+                        let now = Instant::now();
+                        let rto = tcb.rto();
                         self.ip_stack.add_tcp_half_open(*network_tuple);
-                        self.tcb_map.insert(*network_tuple, (tcb, Instant::now()));
+                        self.tcb_map.insert(
+                            *network_tuple,
+                            HalfOpenTcb {
+                                tcb,
+                                created_at: now,
+                                retransmit_at: now + rto,
+                                rto,
+                            },
+                        );
                         self.ip_stack.send_packet(relay_packet).await?;
                         continue;
                     }
-                } else if let Some((tcb, _)) = self.tcb_map.get_mut(network_tuple) {
+                } else if let Some(entry) = self.tcb_map.get_mut(network_tuple) {
                     // SYN_RECEIVED -> ESTABLISHED
-                    if tcb.try_syn_received_to_established(packet.buf) {
-                        let (tcb, _) = self.tcb_map.remove(network_tuple).unwrap();
-                        let stream = TcpStream::new(self.ip_stack.clone(), tcb);
+                    if entry.tcb.try_syn_received_to_established(packet.buf) {
+                        let entry = self.tcb_map.remove(network_tuple).unwrap();
+                        let stream = TcpStream::new(self.ip_stack.clone(), entry.tcb);
                         self.ip_stack.remove_tcp_half_open(network_tuple);
                         return Ok((stream?, peer_addr));
                     }
-                    if tcb.is_close() {
+                    if entry.tcb.is_close() {
                         self.tcb_map.remove(network_tuple).unwrap();
                         self.ip_stack.remove_tcp_half_open(network_tuple);
                     }
@@ -247,13 +283,32 @@ impl TcpListener {
         let now = Instant::now();
         let timeout = Duration::from_secs(10);
         let ip_stack = self.ip_stack.clone();
-        self.tcb_map.retain(|network_tuple, (_, created_at)| {
-            let keep = *created_at + timeout > now;
+        self.tcb_map.retain(|network_tuple, entry| {
+            let keep = entry.created_at + timeout > now;
             if !keep {
                 ip_stack.remove_tcp_half_open(network_tuple);
             }
             keep
         });
+    }
+
+    async fn retransmit_half_open(&mut self) -> io::Result<()> {
+        self.expire_half_open();
+        let now = Instant::now();
+        let mut packets = Vec::new();
+        for entry in self.tcb_map.values_mut() {
+            if entry.retransmit_at <= now {
+                if let Some(packet) = entry.tcb.syn_ack_packet() {
+                    packets.push(packet);
+                }
+                entry.rto = (entry.rto * 2).min(Duration::from_secs(3));
+                entry.retransmit_at = now + entry.rto;
+            }
+        }
+        for packet in packets {
+            self.ip_stack.send_packet(packet).await?;
+        }
+        Ok(())
     }
 }
 #[cfg(feature = "global-ip-stack")]
