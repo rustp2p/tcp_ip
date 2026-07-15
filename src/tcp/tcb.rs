@@ -410,7 +410,9 @@ impl Tcb {
     }
     pub fn try_syn_received_to_established(&mut self, mut buf: Bytes) -> bool {
         let Some(packet) = TcpPacket::new(&buf) else {
-            self.error();
+            return false;
+        };
+        let Some(header_len) = validated_tcp_header_len(&packet, &buf) else {
             return false;
         };
         let flags = packet.get_flags();
@@ -420,7 +422,6 @@ impl Tcb {
             }
             return false;
         }
-        let header_len = packet.get_data_offset() as usize * 4;
         let flags = packet.get_flags();
         if self.state == TcpState::SynReceived
             && flags & ACK == ACK
@@ -458,6 +459,7 @@ impl Tcb {
     }
     pub fn try_syn_sent_to_established(&mut self, buf: Bytes) -> Option<TransportPacket> {
         let packet = TcpPacket::new(&buf)?;
+        validated_tcp_header_len(&packet, &buf)?;
         let flags = packet.get_flags();
         if self.state == TcpState::SynSent && flags & RST == RST {
             if flags & ACK == ACK && packet.get_acknowledgement() == self.snd_seq.add_num(1).0 {
@@ -640,7 +642,9 @@ impl Tcb {
 
     pub fn push_packet(&mut self, mut buf: Bytes) -> Option<TransportPacket> {
         let Some(packet) = TcpPacket::new(&buf) else {
-            self.error();
+            return None;
+        };
+        let Some(header_len) = validated_tcp_header_len(&packet, &buf) else {
             return None;
         };
         let flags = packet.get_flags();
@@ -661,7 +665,6 @@ impl Tcb {
             return Some(reply_packet);
         }
 
-        let header_len = packet.get_data_offset() as usize * 4;
         let seq = SeqNum(packet.get_sequence());
         let segment_len = packet.payload().len() + usize::from(flags & FIN == FIN);
         if matches!(
@@ -908,6 +911,29 @@ impl Tcb {
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
+}
+
+pub(crate) fn validated_tcp_header_len(packet: &TcpPacket<'_>, bytes: &[u8]) -> Option<usize> {
+    let header_len = packet.get_data_offset() as usize * 4;
+    if !(TCP_HEADER_LEN..=bytes.len()).contains(&header_len) {
+        return None;
+    }
+    let options = &bytes[TCP_HEADER_LEN..header_len];
+    let mut offset = 0;
+    while offset < options.len() {
+        match options[offset] {
+            0 => break,
+            1 => offset += 1,
+            _ => {
+                let option_len = *options.get(offset + 1)? as usize;
+                if option_len < 2 || offset + option_len > options.len() {
+                    return None;
+                }
+                offset += option_len;
+            }
+        }
+    }
+    Some(header_len)
 }
 
 /// Implementation related to writing data
@@ -1195,6 +1221,40 @@ mod persist_tests {
 
         assert_eq!(tcb.state, TcpState::Established);
         assert_eq!(tcb.rto(), Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod header_validation_tests {
+    use super::*;
+
+    fn established_tcb() -> Tcb {
+        let mut tcb = Tcb::new_listen(
+            "192.0.2.2:8080".parse().unwrap(),
+            "192.0.2.1:40000".parse().unwrap(),
+            TcpConfig::default(),
+        );
+        tcb.state = TcpState::Established;
+        tcb
+    }
+
+    #[test]
+    fn malformed_tcp_headers_are_dropped_without_closing() {
+        let mut tcb = established_tcb();
+
+        assert!(tcb.push_packet(Bytes::from(vec![0; 19])).is_none());
+
+        let mut oversized_header = vec![0; TCP_HEADER_LEN];
+        oversized_header[12] = 15 << 4;
+        assert!(tcb.push_packet(Bytes::from(oversized_header)).is_none());
+
+        let mut malformed_option = vec![0; TCP_HEADER_LEN + 4];
+        malformed_option[12] = 6 << 4;
+        malformed_option[20] = TcpOptionNumbers::MSS.0;
+        malformed_option[21] = 1;
+        assert!(tcb.push_packet(Bytes::from(malformed_option)).is_none());
+
+        assert_eq!(tcb.state, TcpState::Established);
     }
 }
 

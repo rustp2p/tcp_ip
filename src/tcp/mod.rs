@@ -197,8 +197,11 @@ impl TcpListener {
                     continue;
                 }
                 let Some(tcp_packet) = pnet_packet::tcp::TcpPacket::new(&packet.buf) else {
-                    return Err(Error::new(io::ErrorKind::InvalidInput, "not tcp"));
+                    continue;
                 };
+                if tcb::validated_tcp_header_len(&tcp_packet, &packet.buf).is_none() {
+                    continue;
+                }
                 let acknowledgement = tcp_packet.get_acknowledgement();
                 let sequence = tcp_packet.get_sequence();
                 let local_addr = network_tuple.dst;
