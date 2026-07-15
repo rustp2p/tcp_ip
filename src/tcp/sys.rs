@@ -417,6 +417,9 @@ impl TcpStreamTask {
         let mut attempts = 0;
         let mut time = self.tcb.rto();
         while attempts < 50 {
+            if attempts > 0 {
+                self.tcb.note_syn_retransmission();
+            }
             let Some(packet) = self.tcb.try_syn_sent() else {
                 return if self.tcb.is_close() {
                     Err(io::Error::from(io::ErrorKind::ConnectionRefused))

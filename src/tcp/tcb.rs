@@ -121,6 +121,9 @@ pub struct Tcb {
     srtt: Option<Duration>,
     rttvar: Duration,
     rto: Duration,
+    /// A SYN carrying this TCB's sequence number was retransmitted during
+    /// the handshake. RFC 6298 requires a conservative post-handshake RTO.
+    syn_retransmitted: bool,
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
     last_snd_wnd: u16,
@@ -380,6 +383,7 @@ impl Tcb {
             srtt: None,
             rttvar: config.retransmission_timeout / 2,
             rto: config.retransmission_timeout,
+            syn_retransmitted: false,
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
             last_snd_wnd: 0,
@@ -444,6 +448,7 @@ impl Tcb {
             self.snd_seq = SeqNum(packet.get_acknowledgement());
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.recv_syn_ack();
+            self.apply_post_handshake_rto();
             self.init_congestion_window(true);
             // The SYN-ACK already advertised the current receive window.
             // Starting the stream task with the constructor's zero snapshot
@@ -491,6 +496,7 @@ impl Tcb {
             self.snd_wl1 = SeqNum(packet.get_sequence());
             self.snd_wl2 = AckNum::from(packet.get_acknowledgement());
             self.recv_syn_ack();
+            self.apply_post_handshake_rto();
             // The window field in a SYN-ACK is never scaled.
             self.init_congestion_window(false);
             let relay = self.create_option_transport_packet(ACK, &[], None);
@@ -1119,6 +1125,18 @@ impl Tcb {
     }
     pub fn rto(&self) -> Duration {
         self.rto
+    }
+    pub(crate) fn note_syn_retransmission(&mut self) {
+        self.syn_retransmitted = true;
+    }
+    fn apply_post_handshake_rto(&mut self) {
+        if self.syn_retransmitted && self.rto < Duration::from_secs(3) {
+            // RFC 6298 section 5.7: after a SYN has been retransmitted, use
+            // an RTO of at least three seconds when data transmission starts.
+            self.rto = Duration::from_secs(3);
+            self.srtt = None;
+            self.rttvar = Duration::from_millis(1500);
+        }
     }
     fn reset_write_timeout(&mut self) {
         if !self.inflight_packets.is_empty() {

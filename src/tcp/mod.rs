@@ -301,6 +301,7 @@ impl TcpListener {
         let mut packets = Vec::new();
         for entry in self.tcb_map.values_mut() {
             if entry.retransmit_at <= now {
+                entry.tcb.note_syn_retransmission();
                 if let Some(packet) = entry.tcb.syn_ack_packet() {
                     packets.push(packet);
                 }
