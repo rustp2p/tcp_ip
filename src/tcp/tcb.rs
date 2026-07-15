@@ -93,6 +93,8 @@ pub struct Tcb {
     /// Highest right edge among the peer's SACK blocks; segments at or above
     /// it are not marked lost, so fast retransmit stops there.
     highest_sack_end: Option<SeqNum>,
+    /// The out-of-order block that most recently triggered an ACK.
+    recent_sack_block: Option<(SeqNum, SeqNum)>,
     /// The current recovery was triggered by an RTO: retransmit the whole
     /// window (go-back-n) instead of stopping at `highest_sack_end`.
     rto_recovery: bool,
@@ -351,6 +353,7 @@ impl Tcb {
             sack_enabled: config.sack,
             sack_permitted: false,
             highest_sack_end: None,
+            recent_sack_block: None,
             rto_recovery: false,
             ack_delay: config.ack_delay,
             ack_deadline: None,
@@ -566,9 +569,15 @@ impl Tcb {
                     continue;
                 }
                 let n = payload.len() >> 3;
+                let mut blocks = Vec::with_capacity(n);
                 for index in 0..n {
                     let offset = index * 8;
+                    let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
                     let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                    if left >= right || left < self.rcv_ack || right > self.snd_seq {
+                        continue;
+                    }
+                    blocks.push((left, right));
                     if self.highest_sack_end.is_none_or(|v| right > v) {
                         self.highest_sack_end = Some(right);
                     }
@@ -578,11 +587,8 @@ impl Tcb {
                         continue;
                     }
                     // SACK blocks are not ordered, so every block must be checked
-                    for index in 0..n {
-                        let offset = index * 8;
-                        let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                        let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                        if inflight_packet.start() >= left && inflight_packet.end() <= right {
+                    for (left, right) in &blocks {
+                        if inflight_packet.start() >= *left && inflight_packet.end() <= *right {
                             inflight_packet.confirmed = true;
                             break;
                         }
@@ -828,6 +834,7 @@ impl Tcb {
                 self.recv_fin();
             }
         } else {
+            self.recent_sack_block = Some((unread_packet.start(), unread_packet.end()));
             self.tcp_out_of_order_queue.push(unread_packet);
             self.advice_ack();
             if !self.tcp_out_of_order_queue.is_empty() {
@@ -856,6 +863,9 @@ impl Tcb {
                 self.recv_fin();
                 break;
             }
+        }
+        if self.recent_sack_block.is_some_and(|(_, right)| right <= self.snd_ack) {
+            self.recent_sack_block = None;
         }
     }
     pub fn need_ack(&self) -> bool {
@@ -1364,9 +1374,7 @@ impl Tcb {
         let mut blocks: [(u32, u32); MAX_SACK_BLOCKS] = Default::default();
         let mut count = 0;
         // The queue is ordered by sequence number, so overlapping or adjacent
-        // segments can be merged in one pass. RFC 2018 asks for the most
-        // recently received block first; recency is not tracked, and senders
-        // handle sequence-ordered blocks just as well.
+        // segments can be merged in one pass.
         for packet in &self.tcp_out_of_order_queue {
             let start = packet.start();
             let end = packet.end();
@@ -1384,6 +1392,14 @@ impl Tcb {
             }
             blocks[count] = (start.0, end.0);
             count += 1;
+        }
+        if let Some((recent_left, recent_right)) = self.recent_sack_block {
+            if let Some(index) = blocks[..count]
+                .iter()
+                .position(|(left, right)| recent_left >= SeqNum(*left) && recent_right <= SeqNum(*right))
+            {
+                blocks[..count].swap(0, index);
+            }
         }
         let mut options = BytesMut::with_capacity(4 + count * 8);
         options.put_u8(TcpOptionNumbers::NOP.0);
