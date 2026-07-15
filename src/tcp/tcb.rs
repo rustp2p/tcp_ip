@@ -98,6 +98,11 @@ pub struct Tcb {
     /// The current recovery was triggered by an RTO: retransmit the whole
     /// window (go-back-n) instead of stopping at `highest_sack_end`.
     rto_recovery: bool,
+    /// Whether the sender is in fast recovery after three duplicate ACKs.
+    fast_recovery: bool,
+    /// SND.NXT when fast recovery started. An ACK covering this sequence
+    /// leaves recovery; a smaller advancing ACK is a partial ACK.
+    recovery_point: Option<SeqNum>,
     ack_delay: Option<Duration>,
     /// When the currently deferred ACK must be sent at the latest.
     ack_deadline: Option<Instant>,
@@ -355,6 +360,8 @@ impl Tcb {
             highest_sack_end: None,
             recent_sack_block: None,
             rto_recovery: false,
+            fast_recovery: false,
+            recovery_point: None,
             ack_delay: config.ack_delay,
             ack_deadline: None,
             snd_window_shift_cnt: 0,
@@ -705,12 +712,15 @@ impl Tcb {
                         // Only a pure ACK carrying no data counts as a duplicate ACK
                         if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN && wnd_unchanged {
                             self.duplicate_ack_count += 1;
-                            if self.duplicate_ack_count >= 3 {
-                                self.duplicate_ack_count = 0;
+                            if self.duplicate_ack_count == 3 && !self.fast_recovery {
                                 if self.back_n() {
                                     self.rto_recovery = false;
-                                    self.congestion_window.on_fast_retransmit();
+                                    self.fast_recovery = true;
+                                    self.recovery_point = Some(self.snd_seq);
+                                    self.congestion_window.enter_fast_recovery();
                                 }
+                            } else if self.fast_recovery && self.duplicate_ack_count > 3 {
+                                self.congestion_window.on_additional_duplicate_ack();
                             }
                         }
                     }
@@ -981,9 +991,24 @@ impl Tcb {
         if ack <= self.rcv_ack {
             return;
         }
-        self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
-        self.congestion_window.on_ack(distance);
+        if self.fast_recovery {
+            if self.recovery_point.is_some_and(|recovery_point| ack >= recovery_point) {
+                self.fast_recovery = false;
+                self.recovery_point = None;
+                self.duplicate_ack_count = 0;
+                self.congestion_window.leave_fast_recovery();
+            } else {
+                // NewReno partial ACK: deflate for acknowledged bytes, add
+                // one MSS and immediately retransmit the next unacknowledged
+                // segment without waiting for another three duplicate ACKs.
+                self.congestion_window.on_partial_ack(distance);
+                self.back_n();
+            }
+        } else {
+            self.duplicate_ack_count = 0;
+            self.congestion_window.on_ack(distance);
+        }
         self.rcv_ack = ack;
         if self.highest_sack_end.is_some_and(|v| self.rcv_ack >= v) {
             self.highest_sack_end = None;
@@ -1188,6 +1213,9 @@ impl Tcb {
             // After an RTO everything unacknowledged is presumed lost:
             // retransmit the whole window regardless of SACK hints
             self.rto_recovery = true;
+            self.fast_recovery = false;
+            self.recovery_point = None;
+            self.duplicate_ack_count = 0;
             self.congestion_window.on_rto();
             self.backoff_rto();
             self.reset_write_timeout();
@@ -1521,9 +1549,26 @@ impl CongestionWindow {
         (self.cwnd / 2).max(2 * self.mss)
     }
 
-    pub fn on_fast_retransmit(&mut self) {
+    pub fn enter_fast_recovery(&mut self) {
         self.ssthresh = self.loss_ssthresh();
-        self.cwnd = self.ssthresh;
+        self.cwnd = self.ssthresh.saturating_add(3 * self.mss).min(self.max_cwnd);
+    }
+
+    pub fn on_additional_duplicate_ack(&mut self) {
+        self.cwnd = self.cwnd.saturating_add(self.mss).min(self.max_cwnd);
+    }
+
+    pub fn on_partial_ack(&mut self, bytes_acked: usize) {
+        self.cwnd = self
+            .cwnd
+            .saturating_sub(bytes_acked)
+            .max(self.ssthresh)
+            .saturating_add(self.mss)
+            .min(self.max_cwnd);
+    }
+
+    pub fn leave_fast_recovery(&mut self) {
+        self.cwnd = self.ssthresh.min(self.max_cwnd);
     }
 
     pub fn on_rto(&mut self) {
@@ -1533,6 +1578,41 @@ impl CongestionWindow {
 
     pub fn current_window_size(&self) -> usize {
         self.cwnd
+    }
+}
+
+#[cfg(test)]
+mod congestion_window_tests {
+    use super::*;
+
+    #[test]
+    fn fast_recovery_inflates_and_deflates_the_window() {
+        let mut window = CongestionWindow::default();
+        window.init(10_000, 65_535, 1_000);
+
+        window.enter_fast_recovery();
+        assert_eq!(window.ssthresh, 5_000);
+        assert_eq!(window.cwnd, 8_000);
+
+        window.on_additional_duplicate_ack();
+        assert_eq!(window.cwnd, 9_000);
+
+        window.on_partial_ack(1_000);
+        assert_eq!(window.cwnd, 9_000);
+
+        window.leave_fast_recovery();
+        assert_eq!(window.cwnd, 5_000);
+    }
+
+    #[test]
+    fn retransmission_timeout_collapses_the_window() {
+        let mut window = CongestionWindow::default();
+        window.init(10_000, 65_535, 1_000);
+        window.enter_fast_recovery();
+        window.on_rto();
+
+        assert_eq!(window.cwnd, 1_000);
+        assert_eq!(window.ssthresh, 4_000);
     }
 }
 
