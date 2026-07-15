@@ -1135,12 +1135,22 @@ impl Tcb {
             self.timeout_wait();
             return;
         }
+        if self.snd_wnd == 0 && self.writeable_state() {
+            // A persist probe is not congestion loss and must never make a
+            // responsive zero-window connection time out (RFC 1122).
+            if self.back_n() {
+                self.backoff_rto();
+                self.reset_write_timeout();
+            }
+            return;
+        }
         if self.back_n() {
             // After an RTO everything unacknowledged is presumed lost:
             // retransmit the whole window regardless of SACK hints
             self.rto_recovery = true;
             self.congestion_window.on_rto();
             self.backoff_rto();
+            self.reset_write_timeout();
         } else {
             // Nothing inflight: the give-up counter must still run while an
             // unacknowledged FIN is being retransmitted
@@ -1161,6 +1171,30 @@ impl Tcb {
     }
     pub fn need_retransmission(&self) -> bool {
         self.back_seq.is_some()
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn zero_window_probes_do_not_abort_the_connection() {
+        let mut tcb = Tcb::new_listen(
+            "192.0.2.2:8080".parse().unwrap(),
+            "192.0.2.1:40000".parse().unwrap(),
+            TcpConfig::default(),
+        );
+        tcb.state = TcpState::Established;
+        tcb.snd_wnd = 0;
+        assert!(tcb.write_probe(&[0]).is_some());
+
+        for _ in 0..32 {
+            tcb.timeout();
+        }
+
+        assert_eq!(tcb.state, TcpState::Established);
+        assert_eq!(tcb.rto(), Duration::from_secs(60));
     }
 }
 
