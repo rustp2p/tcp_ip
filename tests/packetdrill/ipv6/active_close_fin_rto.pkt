@@ -26,5 +26,8 @@
 // The socket must remain in TIME_WAIT and ACK a retransmitted peer FIN.
 +0.200 < F. 1:1(0) ack 2 win 65535
 +0.000 > . 2:2(0) ack 2
+// This arrives after the original deadline but before the restarted one.
++0.400 < F. 1:1(0) ack 2 win 65535
++0.000 > . 2:2(0) ack 2
 
 `$TCP_IP_PD_CASE cleanup`

@@ -678,6 +678,10 @@ impl Tcb {
                 | TcpState::TimeWait
         ) {
             if !self.segment_acceptable(seq, segment_len) {
+                if self.state == TcpState::TimeWait && flags & FIN == FIN && seq.add_num(segment_len as u32) == self.snd_ack {
+                    self.recv_fin();
+                    return Some(self.create_transport_packet(ACK, &[]));
+                }
                 self.requires_ack_repeat = true;
                 return None;
             }
@@ -1305,6 +1309,11 @@ impl Tcb {
                 self.snd_ack.add_update(1);
                 self.time_wait = Some(Instant::now() + self.time_wait_timeout);
                 self.state = TcpState::TimeWait
+            }
+            TcpState::TimeWait => {
+                // A retransmitted FIN restarts the 2MSL wait so delayed
+                // duplicates cannot reach a later incarnation of the tuple.
+                self.time_wait = Some(Instant::now() + self.time_wait_timeout);
             }
             _ => {}
         }
