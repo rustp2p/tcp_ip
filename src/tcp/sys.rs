@@ -22,7 +22,6 @@ const MAX_INBOUND_BATCH: usize = 64;
 #[derive(Debug)]
 pub struct TcpStreamTask {
     _bind_addr: Option<BindAddr>,
-    quick_end: bool,
     tcb: Tcb,
     ip_stack: IpStack,
     application_layer_receiver: Receiver<BytesMut>,
@@ -80,7 +79,6 @@ impl TcpStreamTask {
     ) -> Self {
         Self {
             _bind_addr,
-            quick_end: ip_stack.config.tcp_config().quick_end,
             tcb,
             ip_stack,
             application_layer_receiver,
@@ -107,16 +105,6 @@ impl TcpStreamTask {
     pub async fn run0(&mut self) -> io::Result<()> {
         loop {
             if self.tcb.is_close() {
-                return Ok(());
-            }
-            if self.quick_end
-                && self.read_half_closed()
-                && self.write_half_closed
-                && self.tcb.no_inflight_packet()
-                && self.tcb.fin_acknowledged()
-            {
-                // Both halves are closed and the peer has acknowledged everything:
-                // it is safe to skip the remaining teardown states
                 return Ok(());
             }
             if !self.write_half_closed && !self.retransmission {

@@ -279,7 +279,6 @@ pub struct TcpConfig {
     pub mss: Option<u16>,
     pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
-    pub quick_end: bool,
     /// Enable SACK (RFC 2018): negotiate SACK-permitted, advertise received
     /// out-of-order ranges in ACKs, and use the peer's SACK blocks to narrow
     /// retransmissions.
@@ -299,8 +298,6 @@ impl Default for TcpConfig {
             mss: None,
             rcv_wnd: u16::MAX,
             window_shift_cnt: DEFAULT_WINDOW_SHIFT_CNT,
-            // If the stream is closed, exit the corresponding task immediately
-            quick_end: true,
             sack: true,
             ack_delay: None,
         }
