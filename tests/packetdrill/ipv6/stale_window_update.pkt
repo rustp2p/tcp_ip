@@ -1,0 +1,29 @@
+--ip_version=ipv6
+--local_ip=fd3d:fa7b:d17d::2
+--gateway_ip=fd3d:fa7b:d17d::1
+--remote_ip=2001:db8::1
+
+`$TCP_IP_PD_CASE setup ipv6`
+
+0.000 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 listen(3, 1) = 0
++0.000 `$TCP_IP_PD_CASE ctl listen [fd3d:fa7b:d17d::2]:8080`
++0.010 < S 0:0(0) win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > S. 0:0(0) ack 1 win 65535 <...>
++0.000 < . 1:1(0) ack 1 win 1000
+
+// A newer segment closes the window.
++0.010 < . 2:2(0) ack 1 win 0
++0.010 `$TCP_IP_PD_CASE ctl write-zero 2`
+
+// This older but still acceptable update must not reopen it.
++0.010 < . 1:1(0) ack 1 win 1
+
+// A genuinely newer update reopens the window and releases both bytes.
++0.050 < . 3:3(0) ack 1 win 1000
++0.000 > P. 1:3(2) ack 1
++0.000 < . 3:3(0) ack 3 win 1000
+
+`$TCP_IP_PD_CASE cleanup`

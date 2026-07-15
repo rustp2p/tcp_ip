@@ -82,6 +82,8 @@ pub struct Tcb {
     // Received ack,Its starting point is snd_seq
     rcv_ack: AckNum,
     snd_wnd: u16,
+    snd_wl1: SeqNum,
+    snd_wl2: AckNum,
     rcv_wnd: u16,
     mss: u16,
     /// SACK enabled in the local config.
@@ -341,6 +343,8 @@ impl Tcb {
             snd_ack: AckNum::from(0),
             last_snd_ack: AckNum::from(0),
             snd_wnd: 0,
+            snd_wl1: SeqNum(0),
+            snd_wl2: AckNum::from(0),
             rcv_wnd: config.rcv_wnd,
             rcv_ack: snd_seq,
             mss: config.mss.unwrap_or(MSS_MIN),
@@ -394,6 +398,8 @@ impl Tcb {
             self.last_snd_ack = self.snd_ack;
             // self.rcv_seq = self.snd_ack;
             self.snd_wnd = tcp_packet.get_window();
+            self.snd_wl1 = SeqNum(tcp_packet.get_sequence());
+            self.snd_wl2 = AckNum::from(tcp_packet.get_acknowledgement());
             self.recv_syn();
             let options = self.get_options(self.window_scale_negotiated);
             let relay = self.create_option_transport_packet(SYN | ACK, &[], Some(&options));
@@ -422,6 +428,8 @@ impl Tcb {
             && self.snd_seq.add_num(1).0 == packet.get_acknowledgement()
         {
             self.snd_wnd = packet.get_window();
+            self.snd_wl1 = SeqNum(packet.get_sequence());
+            self.snd_wl2 = AckNum::from(packet.get_acknowledgement());
             self.snd_seq = SeqNum(packet.get_acknowledgement());
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.recv_syn_ack();
@@ -468,6 +476,8 @@ impl Tcb {
             self.last_snd_ack = self.snd_ack;
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.snd_wnd = packet.get_window();
+            self.snd_wl1 = SeqNum(packet.get_sequence());
+            self.snd_wl2 = AckNum::from(packet.get_acknowledgement());
             self.recv_syn_ack();
             // The window field in a SYN-ACK is never scaled.
             self.init_congestion_window(false);
@@ -690,11 +700,9 @@ impl Tcb {
                                 }
                             }
                         }
-                        self.snd_wnd = packet.get_window();
-                        self.congestion_window
-                            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
                     }
 
+                    self.update_send_window(&packet);
                     self.update_last_ack(&packet);
                     self.option_sack(&packet);
                 }
@@ -708,6 +716,9 @@ impl Tcb {
                     accepted_flags &= !FIN;
                 } else if flags & FIN == FIN && payload_end >= right_edge {
                     accepted_flags &= !FIN;
+                }
+                if buf.is_empty() && accepted_flags & FIN != FIN {
+                    return None;
                 }
                 let unread_packet = UnreadPacket::new(seq, accepted_flags, buf);
                 if self.recv_buffer_full() {
@@ -727,6 +738,7 @@ impl Tcb {
             TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
+                    self.update_send_window(&packet);
                     self.update_last_ack(&packet);
                     if acknowledgement == self.snd_seq {
                         self.recv_fin_ack()
@@ -929,9 +941,6 @@ impl Tcb {
         if ack <= self.rcv_ack {
             return;
         }
-        self.snd_wnd = tcp_packet.get_window();
-        self.congestion_window
-            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
         self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
         self.congestion_window.on_ack(distance);
@@ -964,6 +973,20 @@ impl Tcb {
             self.recv_fin_ack()
         }
         self.reset_write_timeout();
+    }
+    fn update_send_window(&mut self, tcp_packet: &TcpPacket<'_>) {
+        let seq = SeqNum(tcp_packet.get_sequence());
+        let ack = AckNum::from(tcp_packet.get_acknowledgement());
+        if ack < self.rcv_ack || ack > self.snd_seq {
+            return;
+        }
+        if self.snd_wl1 < seq || (self.snd_wl1 == seq && self.snd_wl2 <= ack) {
+            self.snd_wnd = tcp_packet.get_window();
+            self.snd_wl1 = seq;
+            self.snd_wl2 = ack;
+            self.congestion_window
+                .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
+        }
     }
     fn note_peer_activity(&mut self) {
         self.timeout_count.0 = self.rcv_ack;
