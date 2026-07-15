@@ -640,6 +640,27 @@ impl Tcb {
         }
 
         let header_len = packet.get_data_offset() as usize * 4;
+        let seq = SeqNum(packet.get_sequence());
+        let segment_len = packet.payload().len() + usize::from(flags & FIN == FIN);
+        if matches!(
+            self.state,
+            TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait
+        ) {
+            if !self.segment_acceptable(seq, segment_len) {
+                self.requires_ack_repeat = true;
+                return None;
+            }
+            // Every segment in a synchronized state must carry an ACK.
+            if flags & ACK != ACK {
+                return None;
+            }
+        }
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
                 if flags & ACK == ACK {
@@ -665,21 +686,18 @@ impl Tcb {
                     self.update_last_ack(&packet);
                     self.option_sack(&packet);
                 }
-                let seq = SeqNum(packet.get_sequence());
                 buf.advance(header_len);
-                let unread_packet = UnreadPacket::new(seq, flags, buf);
-                if self.rcv_wnd == 0 {
-                    // The read half has been dropped: discard the data but keep
-                    // advancing the ACK and handle FIN so the connection can still
-                    // be closed normally
-                    if unread_packet.end() > self.snd_ack {
-                        self.snd_ack = unread_packet.end();
-                    }
-                    if flags & FIN == FIN {
-                        self.recv_fin();
-                    }
-                    return None;
+                let mut accepted_flags = flags;
+                let right_edge = self.snd_ack.add_num(self.receive_window_bytes());
+                let payload_end = seq.add_num(buf.len() as u32);
+                if payload_end > right_edge {
+                    let accepted_len = (right_edge - seq).0 as usize;
+                    buf.truncate(accepted_len.min(buf.len()));
+                    accepted_flags &= !FIN;
+                } else if flags & FIN == FIN && payload_end >= right_edge {
+                    accepted_flags &= !FIN;
                 }
+                let unread_packet = UnreadPacket::new(seq, accepted_flags, buf);
                 if self.recv_buffer_full() {
                     // Packet loss occurs when the buffer is full
                     self.requires_ack_repeat = true;
@@ -731,8 +749,28 @@ impl Tcb {
         self.tcp_receive_queue.total_bytes() != 0
     }
     pub fn read_none(&mut self) {
-        self.rcv_wnd = 0;
         self.tcp_receive_queue.clear();
+    }
+
+    fn receive_window_bytes(&self) -> u32 {
+        (self.recv_window() as u32) << self.rcv_window_shift_cnt
+    }
+
+    fn segment_acceptable(&self, seq: SeqNum, segment_len: usize) -> bool {
+        let wnd = self.receive_window_bytes();
+        if segment_len == 0 {
+            return if wnd == 0 {
+                seq == self.snd_ack
+            } else {
+                seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
+            };
+        }
+        if wnd == 0 {
+            return false;
+        }
+        let right_edge = self.snd_ack.add_num(wnd);
+        let segment_last = seq.add_num(segment_len as u32 - 1);
+        (seq >= self.snd_ack && seq < right_edge) || (segment_last >= self.snd_ack && segment_last < right_edge)
     }
     pub fn read(&mut self) -> Option<Bytes> {
         self.tcp_receive_queue.pop()
