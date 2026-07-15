@@ -1,0 +1,24 @@
+--ip_version=ipv4
+--local_ip=192.168.42.2
+--gateway_ip=192.168.42.1
+--netmask_ip=255.255.255.0
+--remote_ip=192.0.2.1
+--bind_port=8080
+--connect_port=8080
+
+`$TCP_IP_PD_CASE setup ipv4`
+
+0.000 socket(..., SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_MARK, [20548], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 connect(3, ..., ...) = -1 EINPROGRESS (Operation now in progress)
++0.000 `$TCP_IP_PD_CASE ctl connect 192.168.42.2:8080 192.0.2.1:8080`
++0.000 > S 0:0(0) win 65535 <...>
++0.000 < S. 0:0(0) ack 1 win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > . 1:1(0) ack 1 win 65535
+
++0.010 `$TCP_IP_PD_CASE ctl write-zero 2`
++0.000 > P. 1:3(2) ack 1 win 65535
++0.000 < . 1:1(0) ack 3 win 65535
+
+`$TCP_IP_PD_CASE cleanup`

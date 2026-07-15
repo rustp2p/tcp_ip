@@ -231,7 +231,10 @@ impl TcpStreamTask {
         self.tcb.mss()
     }
     fn only_recv_in(&self) -> bool {
-        self.retransmission || self.last_buffer.is_some() || self.write_half_closed || self.tcb.limit()
+        // A zero peer window alone must not stop us from receiving the first
+        // application write. Once that write becomes `last_buffer`, this task
+        // switches to network-only polling and arms the persist/probe timer.
+        self.retransmission || self.last_buffer.is_some() || self.write_half_closed
     }
     fn push_application_layer(&mut self) {
         if let Some(sender) = self.application_layer_sender.as_ref() {
@@ -424,7 +427,7 @@ impl TcpStreamTask {
 impl TcpStreamTask {
     pub async fn connect(&mut self) -> io::Result<()> {
         let mut attempts = 0;
-        let mut time = Duration::from_millis(100);
+        let mut time = self.tcb.rto();
         while attempts < 50 {
             let Some(packet) = self.tcb.try_syn_sent() else {
                 return if self.tcb.is_close() {

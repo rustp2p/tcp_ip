@@ -37,6 +37,31 @@ Use TcpListener and TcpStream. Supported over IPv4 and IPv6.
 - The timeout waiting time is fixed and can be configured
 - Selective acknowledgements permitted. (Proactively ACK the need for improvement)
 
+### packetdrill TCP conformance tests
+
+The Linux-only suite under `tests/packetdrill` drives the userspace stack through
+packetdrill's local TUN mode. It covers IPv4 and IPv6 handshake negotiation, data
+and ACK behavior, reassembly/SACK, retransmission and fast recovery, zero-window
+probing, close/TIME_WAIT paths, and RST/duplicate-SYN handling.
+
+On Ubuntu, run as root because the harness needs TUN, raw-socket, and firewall
+access:
+
+```bash
+sudo -E bash scripts/setup_packetdrill.sh --install-deps
+sudo -E bash scripts/run_packetdrill.sh
+```
+
+On Windows with WSL2 Ubuntu 24.04:
+
+```powershell
+pwsh scripts/run_packetdrill_wsl.ps1
+```
+
+The setup script checks out the pinned upstream packetdrill revision into the
+user cache. It does not vendor packetdrill into this repository. Per-case verbose
+logs are written to `target/packetdrill/logs`.
+
 #### Other
 
 Using IpSocket to send and receive packets of other protocols.(Handles all IP upper-layer protocols without requiring

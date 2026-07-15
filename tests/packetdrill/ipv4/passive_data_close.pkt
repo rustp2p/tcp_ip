@@ -1,0 +1,30 @@
+--ip_version=ipv4
+--local_ip=192.168.42.2
+--gateway_ip=192.168.42.1
+--netmask_ip=255.255.255.0
+--remote_ip=192.0.2.1
+
+`$TCP_IP_PD_CASE setup ipv4`
+
+0.000 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 listen(3, 1) = 0
++0.000 `$TCP_IP_PD_CASE ctl listen 192.168.42.2:8080`
++0.010 < S 0:0(0) win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > S. 0:0(0) ack 1 win 65535 <mss 1000,nop,wscale 4,nop,nop,sackOK>
++0.000 < . 1:1(0) ack 1 win 65535
++0.010 `$TCP_IP_PD_CASE ctl write-zero 0`
+
++0.010 < P. 1:5(4) ack 1 win 65535
++0.000 > . 1:1(0) ack 5
++0.010 `$TCP_IP_PD_CASE ctl expect-read-zero 4`
+
++0.010 < F. 5:5(0) ack 1 win 65535
++0.000 > . 1:1(0) ack 6
++0.010 `$TCP_IP_PD_CASE ctl expect-eof`
++0.010 `$TCP_IP_PD_CASE ctl shutdown-write`
++0.000 > F. 1:1(0) ack 6
++0.000 < . 6:6(0) ack 2 win 65535
+
+`$TCP_IP_PD_CASE cleanup`
