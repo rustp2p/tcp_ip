@@ -448,7 +448,11 @@ impl Tcb {
             }
             return None;
         }
-        if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
+        if self.state == TcpState::SynSent
+            && flags & ACK == ACK
+            && flags & SYN == SYN
+            && packet.get_acknowledgement() == self.snd_seq.add_num(1).0
+        {
             self.option(&packet);
             self.snd_seq.add_update(1);
             self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
