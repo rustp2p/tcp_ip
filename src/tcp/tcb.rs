@@ -660,12 +660,8 @@ impl Tcb {
     }
 
     pub fn push_packet(&mut self, mut buf: Bytes) -> Option<TransportPacket> {
-        let Some(packet) = TcpPacket::new(&buf) else {
-            return None;
-        };
-        let Some(header_len) = validated_tcp_header_len(&packet, &buf) else {
-            return None;
-        };
+        let packet = TcpPacket::new(&buf)?;
+        let header_len = validated_tcp_header_len(&packet, &buf)?;
         let flags = packet.get_flags();
         if flags & RST == RST {
             if self.rst_acceptable(&packet) {
