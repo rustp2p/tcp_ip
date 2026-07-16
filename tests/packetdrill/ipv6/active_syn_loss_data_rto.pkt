@@ -1,0 +1,27 @@
+--ip_version=ipv6
+--local_ip=fd3d:fa7b:d17d::2
+--gateway_ip=fd3d:fa7b:d17d::1
+--remote_ip=2001:db8::1
+--bind_port=8080
+--connect_port=8080
+
+`$TCP_IP_PD_CASE setup ipv6`
+
+0.000 socket(..., SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_MARK, [20548], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 connect(3, ..., ...) = -1 EINPROGRESS (Operation now in progress)
++0.000 `$TCP_IP_PD_CASE ctl connect [fd3d:fa7b:d17d::2]:8080 [2001:db8::1]:8080`
++0.000 > S 0:0(0) win 65535 <...>
+// Drop the first SYN, then finish the handshake after its retransmission.
++0.150~+0.450 > S 0:0(0) win 65535 <...>
++0.000 < S. 0:0(0) ack 1 win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > . 1:1(0) ack 1 win 65535
+
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1`
++0.000 > P. 1:2(1) ack 1 win 65535
+// RFC 6298 section 5.7 requires a 3 second data RTO after SYN loss.
++2.700~+3.300 > . 1:2(1) ack 1 win 65535
++0.000 < . 1:1(0) ack 2 win 65535
+
+`$TCP_IP_PD_CASE cleanup`

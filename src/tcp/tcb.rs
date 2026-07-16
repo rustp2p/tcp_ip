@@ -82,6 +82,8 @@ pub struct Tcb {
     // Received ack,Its starting point is snd_seq
     rcv_ack: AckNum,
     snd_wnd: u16,
+    snd_wl1: SeqNum,
+    snd_wl2: AckNum,
     rcv_wnd: u16,
     mss: u16,
     /// SACK enabled in the local config.
@@ -91,14 +93,22 @@ pub struct Tcb {
     /// Highest right edge among the peer's SACK blocks; segments at or above
     /// it are not marked lost, so fast retransmit stops there.
     highest_sack_end: Option<SeqNum>,
+    /// The out-of-order block that most recently triggered an ACK.
+    recent_sack_block: Option<(SeqNum, SeqNum)>,
     /// The current recovery was triggered by an RTO: retransmit the whole
     /// window (go-back-n) instead of stopping at `highest_sack_end`.
     rto_recovery: bool,
+    /// Whether the sender is in fast recovery after three duplicate ACKs.
+    fast_recovery: bool,
+    /// SND.NXT when fast recovery started. An ACK covering this sequence
+    /// leaves recovery; a smaller advancing ACK is a partial ACK.
+    recovery_point: Option<SeqNum>,
     ack_delay: Option<Duration>,
     /// When the currently deferred ACK must be sent at the latest.
     ack_deadline: Option<Instant>,
     snd_window_shift_cnt: u8,
     rcv_window_shift_cnt: u8,
+    window_scale_negotiated: bool,
     duplicate_ack_count: usize,
     tcp_receive_queue: TcpReceiveQueue,
     tcp_out_of_order_queue: TcpOfoQueue,
@@ -111,6 +121,9 @@ pub struct Tcb {
     srtt: Option<Duration>,
     rttvar: Duration,
     rto: Duration,
+    /// A SYN carrying this TCB's sequence number was retransmitted during
+    /// the handshake. RFC 6298 requires a conservative post-handshake RTO.
+    syn_retransmitted: bool,
     timeout_count: (AckNum, usize),
     congestion_window: CongestionWindow,
     last_snd_wnd: u16,
@@ -279,7 +292,6 @@ pub struct TcpConfig {
     pub mss: Option<u16>,
     pub rcv_wnd: u16,
     pub window_shift_cnt: u8,
-    pub quick_end: bool,
     /// Enable SACK (RFC 2018): negotiate SACK-permitted, advertise received
     /// out-of-order ranges in ACKs, and use the peer's SACK blocks to narrow
     /// retransmissions.
@@ -299,8 +311,6 @@ impl Default for TcpConfig {
             mss: None,
             rcv_wnd: u16::MAX,
             window_shift_cnt: DEFAULT_WINDOW_SHIFT_CNT,
-            // If the stream is closed, exit the corresponding task immediately
-            quick_end: true,
             sack: true,
             ack_delay: None,
         }
@@ -343,17 +353,23 @@ impl Tcb {
             snd_ack: AckNum::from(0),
             last_snd_ack: AckNum::from(0),
             snd_wnd: 0,
+            snd_wl1: SeqNum(0),
+            snd_wl2: AckNum::from(0),
             rcv_wnd: config.rcv_wnd,
             rcv_ack: snd_seq,
             mss: config.mss.unwrap_or(MSS_MIN),
             sack_enabled: config.sack,
             sack_permitted: false,
             highest_sack_end: None,
+            recent_sack_block: None,
             rto_recovery: false,
+            fast_recovery: false,
+            recovery_point: None,
             ack_delay: config.ack_delay,
             ack_deadline: None,
             snd_window_shift_cnt: 0,
             rcv_window_shift_cnt: config.window_shift_cnt,
+            window_scale_negotiated: false,
             duplicate_ack_count: 0,
             // rcv_seq: SeqNum(0),
             tcp_receive_queue: Default::default(),
@@ -367,6 +383,7 @@ impl Tcb {
             srtt: None,
             rttvar: config.retransmission_timeout / 2,
             rto: config.retransmission_timeout,
+            syn_retransmitted: false,
             timeout_count: (AckNum::from(0), 0),
             congestion_window: CongestionWindow::default(),
             last_snd_wnd: 0,
@@ -376,7 +393,7 @@ impl Tcb {
     pub fn try_syn_sent(&mut self) -> Option<TransportPacket> {
         if self.state == TcpState::Listen || self.state == TcpState::SynSent {
             self.sent_syn();
-            let options = self.get_options();
+            let options = self.get_options(true);
             let packet = self.create_option_transport_packet(SYN, &[], Some(&options));
             Some(packet)
         } else {
@@ -395,8 +412,10 @@ impl Tcb {
             self.last_snd_ack = self.snd_ack;
             // self.rcv_seq = self.snd_ack;
             self.snd_wnd = tcp_packet.get_window();
+            self.snd_wl1 = SeqNum(tcp_packet.get_sequence());
+            self.snd_wl2 = AckNum::from(tcp_packet.get_acknowledgement());
             self.recv_syn();
-            let options = self.get_options();
+            let options = self.get_options(self.window_scale_negotiated);
             let relay = self.create_option_transport_packet(SYN | ACK, &[], Some(&options));
             Some(relay)
         } else {
@@ -405,7 +424,9 @@ impl Tcb {
     }
     pub fn try_syn_received_to_established(&mut self, mut buf: Bytes) -> bool {
         let Some(packet) = TcpPacket::new(&buf) else {
-            self.error();
+            return false;
+        };
+        let Some(header_len) = validated_tcp_header_len(&packet, &buf) else {
             return false;
         };
         let flags = packet.get_flags();
@@ -415,7 +436,6 @@ impl Tcb {
             }
             return false;
         }
-        let header_len = packet.get_data_offset() as usize * 4;
         let flags = packet.get_flags();
         if self.state == TcpState::SynReceived
             && flags & ACK == ACK
@@ -423,10 +443,13 @@ impl Tcb {
             && self.snd_seq.add_num(1).0 == packet.get_acknowledgement()
         {
             self.snd_wnd = packet.get_window();
+            self.snd_wl1 = SeqNum(packet.get_sequence());
+            self.snd_wl2 = AckNum::from(packet.get_acknowledgement());
             self.snd_seq = SeqNum(packet.get_acknowledgement());
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.recv_syn_ack();
-            self.init_congestion_window();
+            self.apply_post_handshake_rto();
+            self.init_congestion_window(true);
             // The SYN-ACK already advertised the current receive window.
             // Starting the stream task with the constructor's zero snapshot
             // would make the next unrelated inbound packet trigger a spurious
@@ -442,8 +465,16 @@ impl Tcb {
         }
         false
     }
+    pub fn syn_ack_packet(&self) -> Option<TransportPacket> {
+        if self.state != TcpState::SynReceived {
+            return None;
+        }
+        let options = self.get_options(self.window_scale_negotiated);
+        Some(self.create_option_transport_packet(SYN | ACK, &[], Some(&options)))
+    }
     pub fn try_syn_sent_to_established(&mut self, buf: Bytes) -> Option<TransportPacket> {
         let packet = TcpPacket::new(&buf)?;
+        validated_tcp_header_len(&packet, &buf)?;
         let flags = packet.get_flags();
         if self.state == TcpState::SynSent && flags & RST == RST {
             if flags & ACK == ACK && packet.get_acknowledgement() == self.snd_seq.add_num(1).0 {
@@ -451,24 +482,33 @@ impl Tcb {
             }
             return None;
         }
-        if self.state == TcpState::SynSent && flags & ACK == ACK && flags & SYN == SYN {
+        if self.state == TcpState::SynSent
+            && flags & ACK == ACK
+            && flags & SYN == SYN
+            && packet.get_acknowledgement() == self.snd_seq.add_num(1).0
+        {
             self.option(&packet);
             self.snd_seq.add_update(1);
             self.snd_ack = SeqNum::from(packet.get_sequence()).add_num(1);
             self.last_snd_ack = self.snd_ack;
             self.rcv_ack = SeqNum(packet.get_acknowledgement());
             self.snd_wnd = packet.get_window();
+            self.snd_wl1 = SeqNum(packet.get_sequence());
+            self.snd_wl2 = AckNum::from(packet.get_acknowledgement());
             self.recv_syn_ack();
-            self.init_congestion_window();
+            self.apply_post_handshake_rto();
+            // The window field in a SYN-ACK is never scaled.
+            self.init_congestion_window(false);
             let relay = self.create_option_transport_packet(ACK, &[], None);
             return Some(relay);
         }
         None
     }
-    fn init_congestion_window(&mut self) {
+    fn init_congestion_window(&mut self, scale_peer_window: bool) {
         // RFC 6928 initial window
         let initial_cwnd = self.mss as usize * 10;
-        let max_cwnd = (self.snd_wnd as usize) << self.snd_window_shift_cnt;
+        let shift = if scale_peer_window { self.snd_window_shift_cnt } else { 0 };
+        let max_cwnd = (self.snd_wnd as usize) << shift;
         self.congestion_window.init(initial_cwnd, max_cwnd, self.mss as usize);
     }
 }
@@ -483,17 +523,19 @@ impl Tcb {
     pub fn mss(&self) -> u16 {
         self.mss
     }
-    fn get_options(&self) -> BytesMut {
+    fn get_options(&self, include_window_scale: bool) -> BytesMut {
         let mut options = BytesMut::with_capacity(40);
         let mss = self.mss;
         options.put_u8(TcpOptionNumbers::MSS.0);
         options.put_u8(4);
         options.put_u16(mss);
 
-        options.put_u8(TcpOptionNumbers::NOP.0);
-        options.put_u8(TcpOptionNumbers::WSCALE.0);
-        options.put_u8(3);
-        options.put_u8(self.rcv_window_shift_cnt);
+        if include_window_scale {
+            options.put_u8(TcpOptionNumbers::NOP.0);
+            options.put_u8(TcpOptionNumbers::WSCALE.0);
+            options.put_u8(3);
+            options.put_u8(self.rcv_window_shift_cnt);
+        }
         if self.sack_enabled {
             options.put_u8(TcpOptionNumbers::NOP.0);
             options.put_u8(TcpOptionNumbers::NOP.0);
@@ -509,6 +551,7 @@ impl Tcb {
                 TcpOptionNumbers::WSCALE => {
                     if let Some(window_shift_cnt) = payload.first() {
                         self.snd_window_shift_cnt = (*window_shift_cnt).min(14);
+                        self.window_scale_negotiated = true;
                     }
                 }
                 TcpOptionNumbers::MSS => {
@@ -539,9 +582,15 @@ impl Tcb {
                     continue;
                 }
                 let n = payload.len() >> 3;
+                let mut blocks = Vec::with_capacity(n);
                 for index in 0..n {
                     let offset = index * 8;
+                    let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
                     let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
+                    if left >= right || left < self.rcv_ack || right > self.snd_seq {
+                        continue;
+                    }
+                    blocks.push((left, right));
                     if self.highest_sack_end.is_none_or(|v| right > v) {
                         self.highest_sack_end = Some(right);
                     }
@@ -551,11 +600,8 @@ impl Tcb {
                         continue;
                     }
                     // SACK blocks are not ordered, so every block must be checked
-                    for index in 0..n {
-                        let offset = index * 8;
-                        let left: SeqNum = payload[offset..4 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                        let right: SeqNum = payload[4 + offset..8 + offset].try_into().map(u32::from_be_bytes).unwrap().into();
-                        if inflight_packet.start() >= left && inflight_packet.end() <= right {
+                    for (left, right) in &blocks {
+                        if inflight_packet.start() >= *left && inflight_packet.end() <= *right {
                             inflight_packet.confirmed = true;
                             break;
                         }
@@ -595,16 +641,12 @@ impl Tcb {
     }
 
     fn create_packet(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], options: Option<&[u8]>) -> BytesMut {
-        create_packet_raw(
-            &self.local_addr,
-            &self.peer_addr,
-            seq,
-            ack,
-            self.recv_window(),
-            flags,
-            payload,
-            options,
-        )
+        let recv_window = if flags & SYN == SYN {
+            self.receive_buffer_available().min(u16::MAX as usize) as u16
+        } else {
+            self.recv_window()
+        };
+        create_packet_raw(&self.local_addr, &self.peer_addr, seq, ack, recv_window, flags, payload, options)
     }
 }
 
@@ -618,16 +660,16 @@ impl Tcb {
     }
 
     pub fn push_packet(&mut self, mut buf: Bytes) -> Option<TransportPacket> {
-        let Some(packet) = TcpPacket::new(&buf) else {
-            self.error();
-            return None;
-        };
+        let packet = TcpPacket::new(&buf)?;
+        let header_len = validated_tcp_header_len(&packet, &buf)?;
         let flags = packet.get_flags();
         if flags & RST == RST {
-            // RFC 5961: only accept a RST whose sequence number falls inside the
-            // receive window, otherwise a stale packet could tear the connection down
             if self.rst_acceptable(&packet) {
                 self.recv_rst();
+            } else if self.rst_in_window(&packet) {
+                // RFC 5961: an in-window RST that does not exactly match
+                // RCV.NXT is answered with a challenge ACK.
+                return Some(self.create_transport_packet(ACK, &[]));
             }
             return None;
         }
@@ -638,7 +680,31 @@ impl Tcb {
             return Some(reply_packet);
         }
 
-        let header_len = packet.get_data_offset() as usize * 4;
+        let seq = SeqNum(packet.get_sequence());
+        let segment_len = packet.payload().len() + usize::from(flags & FIN == FIN);
+        if matches!(
+            self.state,
+            TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait
+        ) {
+            if !self.segment_acceptable(seq, segment_len) {
+                if self.state == TcpState::TimeWait && flags & FIN == FIN && seq.add_num(segment_len as u32) == self.snd_ack {
+                    self.recv_fin();
+                    return Some(self.create_transport_packet(ACK, &[]));
+                }
+                self.requires_ack_repeat = true;
+                return None;
+            }
+            // Every segment in a synchronized state must carry an ACK.
+            if flags & ACK != ACK {
+                return None;
+            }
+        }
         match self.state {
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
                 if flags & ACK == ACK {
@@ -648,37 +714,38 @@ impl Tcb {
                         // Only a pure ACK carrying no data counts as a duplicate ACK
                         if self.rcv_ack != self.snd_seq && packet.payload().is_empty() && flags & FIN != FIN && wnd_unchanged {
                             self.duplicate_ack_count += 1;
-                            if self.duplicate_ack_count >= 3 {
-                                self.duplicate_ack_count = 0;
+                            if self.duplicate_ack_count == 3 && !self.fast_recovery {
                                 if self.back_n() {
                                     self.rto_recovery = false;
-                                    self.congestion_window.on_fast_retransmit();
+                                    self.fast_recovery = true;
+                                    self.recovery_point = Some(self.snd_seq);
+                                    self.congestion_window.enter_fast_recovery();
                                 }
+                            } else if self.fast_recovery && self.duplicate_ack_count > 3 {
+                                self.congestion_window.on_additional_duplicate_ack();
                             }
                         }
-                        self.snd_wnd = packet.get_window();
-                        self.congestion_window
-                            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
                     }
 
+                    self.update_send_window(&packet);
                     self.update_last_ack(&packet);
                     self.option_sack(&packet);
                 }
-                let seq = SeqNum(packet.get_sequence());
                 buf.advance(header_len);
-                let unread_packet = UnreadPacket::new(seq, flags, buf);
-                if self.rcv_wnd == 0 {
-                    // The read half has been dropped: discard the data but keep
-                    // advancing the ACK and handle FIN so the connection can still
-                    // be closed normally
-                    if unread_packet.end() > self.snd_ack {
-                        self.snd_ack = unread_packet.end();
-                    }
-                    if flags & FIN == FIN {
-                        self.recv_fin();
-                    }
+                let mut accepted_flags = flags;
+                let right_edge = self.snd_ack.add_num(self.receive_window_bytes());
+                let payload_end = seq.add_num(buf.len() as u32);
+                if payload_end > right_edge {
+                    let accepted_len = (right_edge - seq).0 as usize;
+                    buf.truncate(accepted_len.min(buf.len()));
+                    accepted_flags &= !FIN;
+                } else if flags & FIN == FIN && payload_end >= right_edge {
+                    accepted_flags &= !FIN;
+                }
+                if buf.is_empty() && accepted_flags & FIN != FIN {
                     return None;
                 }
+                let unread_packet = UnreadPacket::new(seq, accepted_flags, buf);
                 if self.recv_buffer_full() {
                     // Packet loss occurs when the buffer is full
                     self.requires_ack_repeat = true;
@@ -696,6 +763,7 @@ impl Tcb {
             TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
                 if flags & ACK == ACK {
                     let acknowledgement = AckNum::from(packet.get_acknowledgement());
+                    self.update_send_window(&packet);
                     self.update_last_ack(&packet);
                     if acknowledgement == self.snd_seq {
                         self.recv_fin_ack()
@@ -718,20 +786,40 @@ impl Tcb {
         Some(reply_packet)
     }
     pub(crate) fn rst_acceptable(&self, packet: &TcpPacket<'_>) -> bool {
+        SeqNum(packet.get_sequence()) == self.snd_ack
+    }
+
+    fn rst_in_window(&self, packet: &TcpPacket<'_>) -> bool {
         let seq = SeqNum(packet.get_sequence());
-        let wnd = (self.recv_window() as u32) << self.rcv_window_shift_cnt;
-        if wnd == 0 {
-            seq == self.snd_ack
-        } else {
-            seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
-        }
+        let wnd = self.receive_window_bytes();
+        wnd > 0 && seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
     }
     pub fn readable(&self) -> bool {
         self.tcp_receive_queue.total_bytes() != 0
     }
     pub fn read_none(&mut self) {
-        self.rcv_wnd = 0;
         self.tcp_receive_queue.clear();
+    }
+
+    fn receive_window_bytes(&self) -> u32 {
+        (self.recv_window() as u32) << self.effective_rcv_window_shift()
+    }
+
+    fn segment_acceptable(&self, seq: SeqNum, segment_len: usize) -> bool {
+        let wnd = self.receive_window_bytes();
+        if segment_len == 0 {
+            return if wnd == 0 {
+                seq == self.snd_ack
+            } else {
+                seq >= self.snd_ack && seq < self.snd_ack.add_num(wnd)
+            };
+        }
+        if wnd == 0 {
+            return false;
+        }
+        let right_edge = self.snd_ack.add_num(wnd);
+        let segment_last = seq.add_num(segment_len as u32 - 1);
+        (seq >= self.snd_ack && seq < right_edge) || (segment_last >= self.snd_ack && segment_last < right_edge)
     }
     pub fn read(&mut self) -> Option<Bytes> {
         self.tcp_receive_queue.pop()
@@ -758,6 +846,7 @@ impl Tcb {
                 self.recv_fin();
             }
         } else {
+            self.recent_sack_block = Some((unread_packet.start(), unread_packet.end()));
             self.tcp_out_of_order_queue.push(unread_packet);
             self.advice_ack();
             if !self.tcp_out_of_order_queue.is_empty() {
@@ -786,6 +875,9 @@ impl Tcb {
                 self.recv_fin();
                 break;
             }
+        }
+        if self.recent_sack_block.is_some_and(|(_, right)| right <= self.snd_ack) {
+            self.recent_sack_block = None;
         }
     }
     pub fn need_ack(&self) -> bool {
@@ -824,10 +916,44 @@ impl Tcb {
         self.ack_deadline
     }
     pub fn recv_window(&self) -> u16 {
-        let src_rcv_wnd = (self.rcv_wnd as usize) << self.rcv_window_shift_cnt;
+        let shift = self.effective_rcv_window_shift();
+        let available = self.receive_buffer_available();
+        let max_advertised = (u16::MAX as usize) << shift;
+        let desired = available.min(max_advertised);
+
+        // Receiver SWS avoidance (RFC 1122 section 4.2.3.3): preserve the
+        // previously advertised right edge until the application has freed
+        // at least min(half the receive buffer, one MSS). Window shrinkage
+        // caused by newly received bytes is still advertised immediately.
+        let previous_right_edge = self.last_snd_ack.add_num((self.last_snd_wnd as u32) << shift);
+        let held = if previous_right_edge > self.snd_ack {
+            (previous_right_edge - self.snd_ack).0 as usize
+        } else {
+            0
+        }
+        .min(max_advertised);
+        let threshold = (self.receive_buffer_capacity() / 2).min(self.mss as usize);
+        let advertised = if desired > held && desired - held < threshold {
+            held
+        } else {
+            desired
+        };
+        (advertised >> shift).min(u16::MAX as usize) as u16
+    }
+    fn effective_rcv_window_shift(&self) -> u8 {
+        if self.window_scale_negotiated {
+            self.rcv_window_shift_cnt
+        } else {
+            0
+        }
+    }
+    fn receive_buffer_available(&self) -> usize {
+        let capacity = self.receive_buffer_capacity();
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
-        let rcv_wnd = src_rcv_wnd.saturating_sub(unread_total_bytes);
-        (rcv_wnd >> self.rcv_window_shift_cnt) as u16
+        capacity.saturating_sub(unread_total_bytes)
+    }
+    fn receive_buffer_capacity(&self) -> usize {
+        (self.rcv_wnd as usize) << self.rcv_window_shift_cnt
     }
     fn recv_buffer_full(&self) -> bool {
         // To reduce packet loss, the actual receivable window size is larger than the recv_window()
@@ -835,6 +961,29 @@ impl Tcb {
         let unread_total_bytes = self.tcp_out_of_order_queue.total_bytes() + self.tcp_receive_queue.total_bytes();
         src_rcv_wnd <= unread_total_bytes
     }
+}
+
+pub(crate) fn validated_tcp_header_len(packet: &TcpPacket<'_>, bytes: &[u8]) -> Option<usize> {
+    let header_len = packet.get_data_offset() as usize * 4;
+    if !(TCP_HEADER_LEN..=bytes.len()).contains(&header_len) {
+        return None;
+    }
+    let options = &bytes[TCP_HEADER_LEN..header_len];
+    let mut offset = 0;
+    while offset < options.len() {
+        match options[offset] {
+            0 => break,
+            1 => offset += 1,
+            _ => {
+                let option_len = *options.get(offset + 1)? as usize;
+                if option_len < 2 || offset + option_len > options.len() {
+                    return None;
+                }
+                offset += option_len;
+            }
+        }
+    }
+    Some(header_len)
 }
 
 /// Implementation related to writing data
@@ -868,12 +1017,24 @@ impl Tcb {
         if ack <= self.rcv_ack {
             return;
         }
-        self.snd_wnd = tcp_packet.get_window();
-        self.congestion_window
-            .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
-        self.duplicate_ack_count = 0;
         let mut distance = (ack - self.rcv_ack).0 as usize;
-        self.congestion_window.on_ack(distance);
+        if self.fast_recovery {
+            if self.recovery_point.is_some_and(|recovery_point| ack >= recovery_point) {
+                self.fast_recovery = false;
+                self.recovery_point = None;
+                self.duplicate_ack_count = 0;
+                self.congestion_window.leave_fast_recovery();
+            } else {
+                // NewReno partial ACK: deflate for acknowledged bytes, add
+                // one MSS and immediately retransmit the next unacknowledged
+                // segment without waiting for another three duplicate ACKs.
+                self.congestion_window.on_partial_ack(distance);
+                self.back_n();
+            }
+        } else {
+            self.duplicate_ack_count = 0;
+            self.congestion_window.on_ack(distance);
+        }
         self.rcv_ack = ack;
         if self.highest_sack_end.is_some_and(|v| self.rcv_ack >= v) {
             self.highest_sack_end = None;
@@ -903,6 +1064,20 @@ impl Tcb {
             self.recv_fin_ack()
         }
         self.reset_write_timeout();
+    }
+    fn update_send_window(&mut self, tcp_packet: &TcpPacket<'_>) {
+        let seq = SeqNum(tcp_packet.get_sequence());
+        let ack = AckNum::from(tcp_packet.get_acknowledgement());
+        if ack < self.rcv_ack || ack > self.snd_seq {
+            return;
+        }
+        if self.snd_wl1 < seq || (self.snd_wl1 == seq && self.snd_wl2 <= ack) {
+            self.snd_wnd = tcp_packet.get_window();
+            self.snd_wl1 = seq;
+            self.snd_wl2 = ack;
+            self.congestion_window
+                .update_max_cwnd((self.snd_wnd as usize) << self.snd_window_shift_cnt);
+        }
     }
     fn note_peer_activity(&mut self) {
         self.timeout_count.0 = self.rcv_ack;
@@ -970,6 +1145,18 @@ impl Tcb {
     }
     pub fn rto(&self) -> Duration {
         self.rto
+    }
+    pub(crate) fn note_syn_retransmission(&mut self) {
+        self.syn_retransmitted = true;
+    }
+    fn apply_post_handshake_rto(&mut self) {
+        if self.syn_retransmitted && self.rto < Duration::from_secs(3) {
+            // RFC 6298 section 5.7: after a SYN has been retransmitted, use
+            // an RTO of at least three seconds when data transmission starts.
+            self.rto = Duration::from_secs(3);
+            self.srtt = None;
+            self.rttvar = Duration::from_millis(1500);
+        }
     }
     fn reset_write_timeout(&mut self) {
         if !self.inflight_packets.is_empty() {
@@ -1051,12 +1238,25 @@ impl Tcb {
             self.timeout_wait();
             return;
         }
+        if self.snd_wnd == 0 && self.writeable_state() {
+            // A persist probe is not congestion loss and must never make a
+            // responsive zero-window connection time out (RFC 1122).
+            if self.back_n() {
+                self.backoff_rto();
+                self.reset_write_timeout();
+            }
+            return;
+        }
         if self.back_n() {
             // After an RTO everything unacknowledged is presumed lost:
             // retransmit the whole window regardless of SACK hints
             self.rto_recovery = true;
+            self.fast_recovery = false;
+            self.recovery_point = None;
+            self.duplicate_ack_count = 0;
             self.congestion_window.on_rto();
             self.backoff_rto();
+            self.reset_write_timeout();
         } else {
             // Nothing inflight: the give-up counter must still run while an
             // unacknowledged FIN is being retransmitted
@@ -1077,6 +1277,64 @@ impl Tcb {
     }
     pub fn need_retransmission(&self) -> bool {
         self.back_seq.is_some()
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn zero_window_probes_do_not_abort_the_connection() {
+        let mut tcb = Tcb::new_listen(
+            "192.0.2.2:8080".parse().unwrap(),
+            "192.0.2.1:40000".parse().unwrap(),
+            TcpConfig::default(),
+        );
+        tcb.state = TcpState::Established;
+        tcb.snd_wnd = 0;
+        assert!(tcb.write_probe(&[0]).is_some());
+
+        for _ in 0..32 {
+            tcb.timeout();
+        }
+
+        assert_eq!(tcb.state, TcpState::Established);
+        assert_eq!(tcb.rto(), Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod header_validation_tests {
+    use super::*;
+
+    fn established_tcb() -> Tcb {
+        let mut tcb = Tcb::new_listen(
+            "192.0.2.2:8080".parse().unwrap(),
+            "192.0.2.1:40000".parse().unwrap(),
+            TcpConfig::default(),
+        );
+        tcb.state = TcpState::Established;
+        tcb
+    }
+
+    #[test]
+    fn malformed_tcp_headers_are_dropped_without_closing() {
+        let mut tcb = established_tcb();
+
+        assert!(tcb.push_packet(Bytes::from(vec![0; 19])).is_none());
+
+        let mut oversized_header = vec![0; TCP_HEADER_LEN];
+        oversized_header[12] = 15 << 4;
+        assert!(tcb.push_packet(Bytes::from(oversized_header)).is_none());
+
+        let mut malformed_option = vec![0; TCP_HEADER_LEN + 4];
+        malformed_option[12] = 6 << 4;
+        malformed_option[20] = TcpOptionNumbers::MSS.0;
+        malformed_option[21] = 1;
+        assert!(tcb.push_packet(Bytes::from(malformed_option)).is_none());
+
+        assert_eq!(tcb.state, TcpState::Established);
     }
 }
 
@@ -1128,6 +1386,11 @@ impl Tcb {
                 self.time_wait = Some(Instant::now() + self.time_wait_timeout);
                 self.state = TcpState::TimeWait
             }
+            TcpState::TimeWait => {
+                // A retransmitted FIN restarts the 2MSL wait so delayed
+                // duplicates cannot reach a later incarnation of the tuple.
+                self.time_wait = Some(Instant::now() + self.time_wait_timeout);
+            }
             _ => {}
         }
     }
@@ -1177,9 +1440,7 @@ impl Tcb {
         let mut blocks: [(u32, u32); MAX_SACK_BLOCKS] = Default::default();
         let mut count = 0;
         // The queue is ordered by sequence number, so overlapping or adjacent
-        // segments can be merged in one pass. RFC 2018 asks for the most
-        // recently received block first; recency is not tracked, and senders
-        // handle sequence-ordered blocks just as well.
+        // segments can be merged in one pass.
         for packet in &self.tcp_out_of_order_queue {
             let start = packet.start();
             let end = packet.end();
@@ -1197,6 +1458,14 @@ impl Tcb {
             }
             blocks[count] = (start.0, end.0);
             count += 1;
+        }
+        if let Some((recent_left, recent_right)) = self.recent_sack_block {
+            if let Some(index) = blocks[..count]
+                .iter()
+                .position(|(left, right)| recent_left >= SeqNum(*left) && recent_right <= SeqNum(*right))
+            {
+                blocks[..count].swap(0, index);
+            }
         }
         let mut options = BytesMut::with_capacity(4 + count * 8);
         options.put_u8(TcpOptionNumbers::NOP.0);
@@ -1318,9 +1587,26 @@ impl CongestionWindow {
         (self.cwnd / 2).max(2 * self.mss)
     }
 
-    pub fn on_fast_retransmit(&mut self) {
+    pub fn enter_fast_recovery(&mut self) {
         self.ssthresh = self.loss_ssthresh();
-        self.cwnd = self.ssthresh;
+        self.cwnd = self.ssthresh.saturating_add(3 * self.mss).min(self.max_cwnd);
+    }
+
+    pub fn on_additional_duplicate_ack(&mut self) {
+        self.cwnd = self.cwnd.saturating_add(self.mss).min(self.max_cwnd);
+    }
+
+    pub fn on_partial_ack(&mut self, bytes_acked: usize) {
+        self.cwnd = self
+            .cwnd
+            .saturating_sub(bytes_acked)
+            .max(self.ssthresh)
+            .saturating_add(self.mss)
+            .min(self.max_cwnd);
+    }
+
+    pub fn leave_fast_recovery(&mut self) {
+        self.cwnd = self.ssthresh.min(self.max_cwnd);
     }
 
     pub fn on_rto(&mut self) {
@@ -1330,6 +1616,90 @@ impl CongestionWindow {
 
     pub fn current_window_size(&self) -> usize {
         self.cwnd
+    }
+}
+
+#[cfg(test)]
+mod congestion_window_tests {
+    use super::*;
+
+    #[test]
+    fn fast_recovery_inflates_and_deflates_the_window() {
+        let mut window = CongestionWindow::default();
+        window.init(10_000, 65_535, 1_000);
+
+        window.enter_fast_recovery();
+        assert_eq!(window.ssthresh, 5_000);
+        assert_eq!(window.cwnd, 8_000);
+
+        window.on_additional_duplicate_ack();
+        assert_eq!(window.cwnd, 9_000);
+
+        window.on_partial_ack(1_000);
+        assert_eq!(window.cwnd, 9_000);
+
+        window.leave_fast_recovery();
+        assert_eq!(window.cwnd, 5_000);
+    }
+
+    #[test]
+    fn retransmission_timeout_collapses_the_window() {
+        let mut window = CongestionWindow::default();
+        window.init(10_000, 65_535, 1_000);
+        window.enter_fast_recovery();
+        window.on_rto();
+
+        assert_eq!(window.cwnd, 1_000);
+        assert_eq!(window.ssthresh, 4_000);
+    }
+}
+
+#[cfg(test)]
+mod receive_window_tests {
+    use super::*;
+
+    fn test_tcb() -> Tcb {
+        let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let config = TcpConfig {
+            mss: Some(1000),
+            rcv_wnd: 4000,
+            window_shift_cnt: 0,
+            ..Default::default()
+        };
+        let mut tcb = Tcb::new_listen(local, peer, config);
+        tcb.state = TcpState::Established;
+        tcb
+    }
+
+    #[test]
+    fn small_application_reads_do_not_open_tiny_windows() {
+        let mut tcb = test_tcb();
+        for _ in 0..16 {
+            tcb.tcp_receive_queue.push(Bytes::from(vec![0; 250]));
+        }
+        tcb.perform_post_ack_action();
+        assert_eq!(tcb.recv_window(), 0);
+
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 0);
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 0);
+
+        assert_eq!(tcb.read().unwrap().len(), 250);
+        assert_eq!(tcb.recv_window(), 1000);
+    }
+
+    #[test]
+    fn incoming_data_preserves_the_advertised_right_edge() {
+        let mut tcb = test_tcb();
+        tcb.perform_post_ack_action();
+        assert_eq!(tcb.recv_window(), 4000);
+
+        tcb.snd_ack = tcb.snd_ack.add_num(250);
+        tcb.tcp_receive_queue.push(Bytes::from(vec![0; 250]));
+        assert_eq!(tcb.recv_window(), 3750);
     }
 }
 

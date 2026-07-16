@@ -1,0 +1,34 @@
+--ip_version=ipv4
+--local_ip=192.168.42.2
+--gateway_ip=192.168.42.1
+--netmask_ip=255.255.255.0
+--remote_ip=192.0.2.1
+
+`$TCP_IP_PD_CASE setup ipv4`
+
+0.000 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 listen(3, 1) = 0
++0.000 `$TCP_IP_PD_CASE ctl listen 192.168.42.2:8080`
++0.010 < S 0:0(0) win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.000 > S. 0:0(0) ack 1 win 65535 <...>
++0.000 < . 1:1(0) ack 1 win 65535
+
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1000`
++0.000 > P. 1:1001(1000) ack 1
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1000`
++0.000 > P. 1001:2001(1000) ack 1
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1000`
++0.000 > P. 2001:3001(1000) ack 1
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1000`
++0.000 > P. 3001:4001(1000) ack 1
+
+// An out-of-range SACK block cannot suppress fast retransmit.
++0.010 < . 1:1(0) ack 1 win 65535 <nop,nop,sack 1:10000000>
++0.010 < . 1:1(0) ack 1 win 65535 <nop,nop,sack 1:10000000>
++0.010 < . 1:1(0) ack 1 win 65535 <nop,nop,sack 1:10000000>
++0.000 > . 1:1001(1000) ack 1
++0.000 < . 1:1(0) ack 4001 win 65535
+
+`$TCP_IP_PD_CASE cleanup`

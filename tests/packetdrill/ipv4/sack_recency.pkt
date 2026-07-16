@@ -11,16 +11,13 @@
 +0.000 bind(3, ..., ...) = 0
 +0.000 listen(3, 1) = 0
 +0.000 `$TCP_IP_PD_CASE ctl listen 192.168.42.2:8080`
-+0.010 < S 0:0(0) win 0 <mss 1000,sackOK,nop,nop,nop,wscale 0>
++0.010 < S 0:0(0) win 65535 <mss 1000,sackOK,nop,nop,nop,wscale 0>
 +0.000 > S. 0:0(0) ack 1 win 65535 <...>
-+0.000 < . 1:1(0) ack 1 win 0
++0.000 < . 1:1(0) ack 1 win 65535
 
-+0.010 `$TCP_IP_PD_CASE ctl write-zero 2`
-+0.150~+0.450 > . 1:2(1) ack 1
-// A dropped persist probe is retransmitted without aborting the connection.
-+0.150~+0.450 > . 1:2(1) ack 1
-+0.000 < . 1:1(0) ack 2 win 1000
-+0.000 > P. 2:3(1) ack 1
-+0.000 < . 1:1(0) ack 3 win 1000
++0.010 < . 1001:1501(500) ack 1 win 65535
++0.000 > . 1:1(0) ack 1 <nop,nop,sack 1001:1501>
++0.010 < . 2001:3001(1000) ack 1 win 65535
++0.000 > . 1:1(0) ack 1 <nop,nop,sack 2001:3001 1001:1501>
 
 `$TCP_IP_PD_CASE cleanup`

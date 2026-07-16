@@ -1,0 +1,26 @@
+--ip_version=ipv6
+--local_ip=fd3d:fa7b:d17d::2
+--gateway_ip=fd3d:fa7b:d17d::1
+--remote_ip=2001:db8::1
+--bind_port=8080
+--connect_port=8080
+
+`$TCP_IP_PD_CASE setup ipv6`
+
+0.000 socket(..., SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP) = 3
++0.000 setsockopt(3, SOL_SOCKET, SO_MARK, [20548], 4) = 0
++0.000 bind(3, ..., ...) = 0
++0.000 connect(3, ..., ...) = -1 EINPROGRESS (Operation now in progress)
++0.000 `$TCP_IP_PD_CASE ctl connect [fd3d:fa7b:d17d::2]:8080 [2001:db8::1]:8080`
++0.000 > S 0:0(0) win 65535 <...>
+
+// The SYN-ACK window is unscaled even though subsequent windows use WS=4.
++0.000 < S. 0:0(0) ack 1 win 1000 <mss 1000,sackOK,nop,nop,nop,wscale 4>
++0.000 > . 1:1(0) ack 1 win 65535
++0.010 `$TCP_IP_PD_CASE ctl write-zero 1500`
++0.000 > P. 1:1001(1000) ack 1
++0.000 < . 1:1(0) ack 1001 win 1000
++0.000 > P. 1001:1501(500) ack 1
++0.000 < . 1:1(0) ack 1501 win 1000
+
+`$TCP_IP_PD_CASE cleanup`
